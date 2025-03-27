@@ -1,0 +1,32 @@
+[
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "Which vendors have the highest outstanding balances?",
+        "query": "SELECT TOP 50 Vendor, [Balance Outstanding] FROM VendorAging_View ORDER BY [Balance Outstanding] DESC;",
+        "reasoning": "This query retrieves the vendors with the highest outstanding balances."
+    },
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "What is the total outstanding balance by country?",
+        "query": "SELECT country_name, SUM([Balance Outstanding]) AS Total_Balance FROM VendorAging_View GROUP BY country_name ORDER BY Total_Balance DESC",
+        "reasoning": "This query calculates outstanding vendor balances per country."
+    },
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "Which vendors have the most overdue payments?",
+        "query": "SELECT distinct TOP 50  Vendor, [Balance Outstanding] FROM VendorAging_View WHERE [Balance Outstanding] < 0 ORDER BY [Balance Outstanding] ASC",
+        "reasoning": "This query identifies vendors with the highest overdue balances."
+    },
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "What is the distribution of overdue payments by aging category?",
+        "query": "SELECT SUM(Aging_0_30) AS Aging_0_30, SUM(Aging_31_60) AS Aging_31_60, SUM(Aging_61_90) AS Aging_61_90, SUM(Aging_91_120) AS Aging_91_120, SUM(Aging_121_180) AS Aging_121_180, SUM(Aging_181_360) AS Aging_181_360, SUM(Above_361_Aging) AS Above_361_Aging FROM VendorAging_View WHERE [Balance Outstanding] < 0;",
+        "reasoning": "This query aggregates overdue vendor balances by aging category."
+    },
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "Which account managers have the most outstanding vendor payments?",
+        "query": "SELECT TOP 50 AccountManager_Name, SUM([Balance Outstanding]) AS Total_Outstanding FROM VendorAging_View GROUP BY AccountManager_Name ORDER BY Total_Outstanding DESC",
+        "reasoning": "This query identifies account managers responsible for the highest vendor payables."
+    }
+]

@@ -1,0 +1,32 @@
+[
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "Which customers have the highest outstanding balances?",
+        "query": "SELECT Customer, [Balance Outstanding] FROM CustomerAging_View ORDER BY [Balance Outstanding] DESC",
+        "reasoning": "This query identifies customers with the highest unpaid balances."
+    },
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "What is the total outstanding balance by country?",
+        "query": "SELECT Country, SUM([Balance Outstanding]) AS Total_Outstanding_Balance FROM CustomerAging_View GROUP BY Country ORDER BY Total_Outstanding_Balance DESC",
+        "reasoning": "This query aggregates outstanding balances for each country."
+    },
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "What is the aging breakdown of outstanding balances?",
+        "query": "SELECT [0 - 30 Aging], SUM([Balance Outstanding]) AS Total_Outstanding_Balance FROM CustomerAging_View GROUP BY [0 - 30 Aging] UNION ALL SELECT [31 - 60 Aging], SUM([Balance Outstanding]) FROM CustomerAging_View GROUP BY [31 - 60 Aging] UNION ALL SELECT [61 - 90 Aging], SUM([Balance Outstanding]) FROM CustomerAging_View GROUP BY [61 - 90 Aging] UNION ALL SELECT [91 - 120 Aging], SUM([Balance Outstanding]) FROM CustomerAging_View GROUP BY [91 - 120 Aging] UNION ALL SELECT [121 - 180 Aging], SUM([Balance Outstanding]) FROM CustomerAging_View GROUP BY [121 - 180 Aging] UNION ALL SELECT [181 - 360 Aging], SUM([Balance Outstanding]) FROM CustomerAging_View GROUP BY [181 - 360 Aging] UNION ALL SELECT [Above 361 Aging], SUM([Balance Outstanding]) FROM CustomerAging_View GROUP BY [Above 361 Aging] ORDER BY [0 - 30 Aging];",
+        "reasoning": "This query summarizes overdue amounts into different aging categories."
+    },
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "Which account managers have the highest overdue balances?",
+        "query": "SELECT AccountManager_Name, SUM([Balance Outstanding]) AS Total_Balance FROM CustomerAging_View GROUP BY AccountManager_Name ORDER BY Total_Balance DESC",
+        "reasoning": "This query retrieves account managers overseeing the most overdue accounts."
+    },
+    {
+        "datasource": "ds1-insights-datawarehouse",
+        "question": "Which customers have the most overdue invoices?",
+        "query": "SELECT TOP 50 Customer, COUNT(Document_No) AS Overdue_Invoices FROM CustomerAging_View WHERE [Balance Outstanding] > 0 GROUP BY Customer ORDER BY Overdue_Invoices DESC;",
+        "reasoning": "This query counts the number of overdue invoices per customer."
+    }
+]

@@ -1,0 +1,43 @@
+python3 -m venv venv ==> Create venv
+source venv/bin/activate ==> Activate venv
+deactivate
+pip install --upgrade pip
+pip install -r requirements.txt
+pip freeze > requirements_prod.txt
+pip freeze > requirements.txt
+
+
+pyenv
+pyenv versions
+pyenv install 3.10.0
+pyenv global 3.10.0
+pyenv local 3.10.0
+pyenv uninstall 3.10.0
+
+
+
+rg: exquitech-ai-rg
+region: UAE North 
+subscription id: 91429568-a3c7-465d-9272-8954bc2d7f3d
+
+az servicebus namespace create --resource-group exquitech-ai-rg \
+  --name insightshq-service-bus \
+  --location uaenorth \
+  --sku Standard
+
+az servicebus queue create --resource-group exquitech-ai-rg \
+  --namespace-name insightshq-service-bus \
+  --name nl2sql-requests \
+  --max-size 1024 \
+  --default-message-time-to-live PT1H
+
+
+az servicebus namespace authorization-rule keys list \
+    --resource-group exquitech-ai-rg \
+    --namespace-name insightshq-service-bus \
+    --name RootManageSharedAccessKey \
+    --query primaryConnectionString \
+    --output tsv
+
+
+chmod +x cosmos-setup.sh

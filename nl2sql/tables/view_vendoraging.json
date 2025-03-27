@@ -1,0 +1,28 @@
+{
+    "table": "VendorAging_View",
+    "description": "Vendor aging report tracking outstanding balances and overdue payments for suppliers. Includes salesperson, account manager, and country details. Tracks aging categories from future payments to those overdue beyond 361 days, along with the last payment details.",
+    "datasource": "ds1-insights-datawarehouse",
+    "columns": [
+        { "name": "SalesPerson_Name", "description": "Name of the salesperson responsible for vendor transactions." },
+        { "name": "SalesPersonID", "description": "Unique identifier of the salesperson associated with the vendor.", "type": "varchar(50)" },
+        { "name": "AccountManager_ID", "description": "Unique identifier for the account manager overseeing vendor relations.", "type": "varchar(50)" },
+        { "name": "AccountManager_Name", "description": "Name of the account manager overseeing vendor relations.", "type": "varchar(50)" },
+        { "name": "country_id", "description": "Unique identifier for the country where the vendor is located.", "type": "varchar(50)" },
+        { "name": "country_name", "description": "Name of the country where the vendor is located.", "type": "varchar(50)" },
+        { "name": "Company", "description": "Company name of the vendor.", "type": "varchar(50)" },
+        { "name": "Vendor ID", "description": "Unique identifier for the vendor.", "type": "varchar(50)" },
+        { "name": "Vendor", "description": "Vendor name.", "type": "varchar(50)" },
+        { "name": "Balance Outstanding", "description": "Total outstanding balance due to the vendor.", "type": "decimal" },
+        { "name": "Future_Aging", "description": "Future-dated outstanding payments.", "type": "decimal" },
+        { "name": "Aging_0_30", "description": "Amount overdue within 0-30 days.", "type": "decimal" },
+        { "name": "Aging_31_60", "description": "Amount overdue within 31-60 days.", "type": "decimal" },
+        { "name": "Aging_61_90", "description": "Amount overdue within 61-90 days.", "type": "decimal" },
+        { "name": "Aging_91_120", "description": "Amount overdue within 91-120 days.", "type": "decimal" },
+        { "name": "Aging_121_180", "description": "Amount overdue within 121-180 days.", "type": "decimal" },
+        { "name": "Aging_181_360", "description": "Amount overdue within 181-360 days.", "type": "decimal" },
+        { "name": "Above_361_Aging", "description": "Amount overdue for more than 361 days.", "type": "decimal" },
+        { "name": "%GT", "description": "Percentage of total outstanding balance unpaid.", "type": "numeric" },
+        { "name": "LP Date", "description": "Last payment date for the vendor.", "type": "date" },
+        { "name": "Vendor LP Amount", "description": "Last payment amount made to the vendor.", "type": "decimal" }
+    ]
+}
