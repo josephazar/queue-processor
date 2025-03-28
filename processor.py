@@ -1,7 +1,6 @@
 import os
 import json
 import time
-import logging
 import asyncio
 import traceback
 import sys
@@ -9,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from azure.servicebus import ServiceBusClient, ServiceBusMessage
 import importlib.util
+from pathlib import Path
 
 # Add src directory to the path for importing
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -28,7 +28,21 @@ from config import (
     DATABASE_TYPE,
     validate_config
 )
-from database import store_request, update_request_status, cleanup_old_requests, get_request_status
+
+# Import database functions with retry capabilities
+from database import (
+    store_request, 
+    update_request_status, 
+    cleanup_old_requests, 
+    get_request_status,
+    store_conversation,
+    get_assistant_last_activity,
+    cleanup_old_conversations,
+    bulk_store_conversations
+)
+
+# Import logging utils
+from logging_utils import setup_logging
 
 # Check if src/main.py exists and import initialize_assistant
 main_path = os.path.join(src_dir, "main.py")
@@ -40,17 +54,9 @@ if os.path.exists(main_path):
 else:
     raise ImportError("Could not find src/main.py which contains initialize_assistant")
 
-# Configure logging
-os.makedirs(LOGS_DIR, exist_ok=True)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(os.path.join(LOGS_DIR, "processor.log")),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger("nl2sql_processor")
+# Set up logging with environment-aware configuration
+logger = setup_logging(LOGS_DIR, "nl2sql_processor")
+logger.info("NL2SQL Queue Processor starting up")
 
 # Validate configuration
 validate_config()
@@ -65,6 +71,14 @@ active_requests_lock = threading.RLock()
 # Cache for assistants to avoid recreating them
 assistant_cache = {}
 assistant_cache_lock = threading.RLock()
+
+# Message batch tracking for bulk operations
+pending_conversations = []
+pending_conversations_lock = threading.RLock()
+
+# Constants
+ASSISTANT_INACTIVITY_TIMEOUT = 60 * 60  # 60 minutes in seconds
+BULK_INSERT_THRESHOLD = 10  # Number of conversations to batch before inserting
 
 async def delete_assistant(assistant_id):
     """
@@ -88,7 +102,10 @@ async def delete_assistant(assistant_id):
 
         # Handle the response
         if response.status_code in [200, 201, 202, 204]:
-            logger.info(f"Assistant {assistant_id} deleted successfully")
+            logger.log_with_context(
+                f"Assistant deleted successfully", 
+                assistant_id=assistant_id
+            )
             
             # Remove from cache if present
             with assistant_cache_lock:
@@ -105,7 +122,10 @@ async def delete_assistant(assistant_id):
             }
         else:
             error_msg = f"Error deleting assistant: {response.text}"
-            logger.error(error_msg)
+            logger.error_with_context(
+                error_msg,
+                assistant_id=assistant_id
+            )
             return {
                 "status": "error",
                 "message": error_msg,
@@ -113,8 +133,12 @@ async def delete_assistant(assistant_id):
                 "thread_id": None
             }
     except Exception as e:
-        logger.error(f"Error deleting assistant: {e}")
-        traceback.print_exc()
+        logger.error_with_context(
+            f"Error deleting assistant", 
+            assistant_id=assistant_id,
+            exc_info=True,
+            error=str(e)
+        )
         return {
             "status": "error", 
             "message": f"Error deleting assistant: {str(e)}",
@@ -141,7 +165,48 @@ def cache_assistant(user_email, assistant_id, thread_id=None):
             "last_used": time.time()
         }
 
-async def process_question(request_id, question, assistant_id=None, thread_id=None, user_email=None):
+def maybe_flush_conversation_batch():
+    """Check if we have enough pending conversations to do a bulk insert"""
+    global pending_conversations
+    conversations_to_insert = []
+    with pending_conversations_lock:
+        if len(pending_conversations) >= BULK_INSERT_THRESHOLD:
+            conversations_to_insert = pending_conversations[:]
+            pending_conversations = []
+    
+    if conversations_to_insert:
+        try:
+            count = bulk_store_conversations(conversations_to_insert)
+            logger.log_with_context(f"Bulk inserted {count} conversations")
+        except Exception as e:
+            logger.error_with_context(
+                "Failed to bulk insert conversations", 
+                exc_info=True,
+                count=len(conversations_to_insert),
+                error=str(e)
+            )
+            # Fall back to individual inserts
+            for conv in conversations_to_insert:
+                try:
+                    store_conversation(
+                        request_id=conv["request_id"],
+                        question=conv["question"],
+                        answer=conv["answer"],
+                        user_email=conv.get("user_email"),
+                        assistant_id=conv.get("assistant_id"),
+                        thread_id=conv.get("thread_id"),
+                        report_name=conv.get("report_name"),
+                        request_type=conv.get("request_type"),
+                        conversation_id=conv.get("conversation_id")
+                    )
+                except Exception as inner_e:
+                    logger.error_with_context(
+                        "Failed to store individual conversation", 
+                        request_id=conv.get("request_id"),
+                        error=str(inner_e)
+                    )
+
+async def process_question(request_id, question, assistant_id=None, thread_id=None, user_email=None, request_type=None, report_name=None):
     """
     Process a user question using the NL2SQL assistant.
     This is the core function that communicates with the AI model.
@@ -152,15 +217,30 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
         assistant_id (str, optional): ID of an existing assistant to use
         thread_id (str, optional): ID of an existing conversation thread
         user_email (str, optional): Email of the user making the request
+        request_type (str, optional): Type of request being made
+        report_name (str, optional): Name of the report if applicable
         
     Returns:
         dict: Response with assistant_id, thread_id, and the answer
     """
+    start_time = time.time()
+    
     try:
-        logger.info(f"Processing question for request {request_id}: '{question[:50]}...'")
+        logger.log_with_context(
+            f"Processing question", 
+            request_id=request_id,
+            user_email=user_email,
+            assistant_id=assistant_id,
+            thread_id=thread_id
+        )
         
         # Check if this is a termination request
         if any(word == question.lower() for word in ["bye", "exit", "end"]):
+            logger.log_with_context(
+                "Received termination request", 
+                request_id=request_id, 
+                user_email=user_email
+            )
             if assistant_id:
                 # If we have an assistant_id, delete it using the delete_assistant function
                 return await delete_assistant(assistant_id)
@@ -176,7 +256,12 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
         if not assistant_id and user_email:
             cached_assistant_id, cached_thread_id = get_cached_assistant(user_email)
             if cached_assistant_id:
-                logger.info(f"Using cached assistant {cached_assistant_id} for user {user_email}")
+                logger.log_with_context(
+                    "Using cached assistant", 
+                    request_id=request_id,
+                    user_email=user_email,
+                    assistant_id=cached_assistant_id
+                )
                 assistant_id = cached_assistant_id
                 # Only use cached thread if explicitly provided or not processing a new question
                 if thread_id is None and cached_thread_id:
@@ -184,19 +269,36 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
         
         # Initialize assistant - either new or existing
         if assistant_id:
-            logger.info(f"Using assistant: {assistant_id} (new: False)")
+            logger.log_with_context(
+                "Using existing assistant", 
+                request_id=request_id,
+                assistant_id=assistant_id
+            )
             sql_assistant = initialize_assistant(DATABASE_TYPE, assistant_id=assistant_id)
         else:
-            logger.info(f"Creating new assistant for user {user_email}")
+            logger.log_with_context(
+                "Creating new assistant", 
+                request_id=request_id,
+                user_email=user_email
+            )
             sql_assistant = initialize_assistant(DATABASE_TYPE)
             assistant_id = sql_assistant.assistant.assistant_id
-            logger.info(f"Using assistant: {assistant_id} (new: True)")
+            logger.log_with_context(
+                "Created new assistant", 
+                request_id=request_id,
+                assistant_id=assistant_id
+            )
             
         # Create a thread if needed
         if not thread_id:
             thread = sql_assistant.assistant.create_thread()
             thread_id = thread.id
-            logger.info(f"Created new thread {thread_id}")
+            logger.log_with_context(
+                "Created new thread", 
+                request_id=request_id,
+                thread_id=thread_id,
+                assistant_id=assistant_id
+            )
         
         # Update cache with assistant info
         if user_email:
@@ -205,7 +307,7 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
         # Process the question with a timeout
         try:
             # Use a timer to implement a timeout since we can't use asyncio.wait_for
-            start_time = time.time()
+            start_processing_time = time.time()
             timeout = 120  # 2 minute timeout
             
             # Call create_response directly - it's not awaitable
@@ -215,11 +317,48 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             )
             
             # Check if we timed out during processing
-            if time.time() - start_time > timeout:
-                logger.warning(f"Request {request_id} processing took longer than {timeout} seconds")
+            processing_duration = time.time() - start_processing_time
+            if processing_duration > timeout:
+                logger.warning(
+                    f"Request processing took longer than timeout", 
+                    request_id=request_id,
+                    duration=processing_duration,
+                    timeout=timeout
+                )
             
             # Extract answer
             answer = response_dict.get("answer", "No answer was generated")
+            
+            # Prepare conversation document
+            conversation_doc = {
+                "request_id": request_id,
+                "question": question,
+                "answer": answer,
+                "user_email": user_email,
+                "assistant_id": assistant_id,
+                "thread_id": thread_id,
+                "report_name": report_name,
+                "request_type": request_type,
+                "conversation_id": None,  # We don't have conversation_id yet
+                "created_at": int(time.time()),
+                "updated_at": int(time.time())
+            }
+            
+            # Add to batch for bulk insertion
+            with pending_conversations_lock:
+                pending_conversations.append(conversation_doc)
+            
+            # Check if we should do a bulk insert
+            maybe_flush_conversation_batch()
+            
+            # Calculate total processing time
+            total_duration = time.time() - start_time
+            logger.log_with_context(
+                "Completed processing question", 
+                request_id=request_id,
+                user_email=user_email,
+                duration=total_duration
+            )
             
             # Return the response with assistant and thread IDs
             return {
@@ -229,7 +368,14 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
                 "thread_id": thread_id
             }
         except Exception as e:
-            logger.error(f"Error calling create_response: {str(e)}")
+            logger.error_with_context(
+                "Error calling create_response", 
+                request_id=request_id,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                exc_info=True,
+                error=str(e)
+            )
             return {
                 "status": "error",
                 "message": f"Error processing question: {str(e)}",
@@ -238,8 +384,13 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             }
     
     except Exception as e:
-        logger.error(f"Error processing question for request {request_id}: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error_with_context(
+            "Error processing question", 
+            request_id=request_id,
+            user_email=user_email,
+            exc_info=True,
+            error=str(e)
+        )
         return {
             "status": "error",
             "message": f"Error processing question: {str(e)}",
@@ -253,6 +404,7 @@ async def process_message(message, receiver):
     """
     request_id = None
     processing_started = False
+    start_time = time.time()
     
     try:
         # Convert message body to bytes if it's a generator
@@ -271,16 +423,25 @@ async def process_message(message, receiver):
         thread_id = body.get("thread_id")
         user_email = body.get("user_email")
         request_type = body.get("request_type", "nl2sql_chat")
+        report_name = body.get("report_name")  # Add report_name extraction
         
         if not request_id or not question:
-            logger.error("Message missing required fields (request_id, question)")
+            logger.error_with_context(
+                "Message missing required fields", 
+                request_id=request_id,
+                fields=body.keys()
+            )
             receiver.complete_message(message)
             return
         
         # Thread safety: Check if this request is already being processed
         with active_requests_lock:
             if request_id in active_requests:
-                logger.info(f"Request {request_id} is already being processed, skipping")
+                logger.log_with_context(
+                    "Request already being processed, skipping", 
+                    request_id=request_id,
+                    user_email=user_email
+                )
                 receiver.complete_message(message)
                 return
             
@@ -291,7 +452,11 @@ async def process_message(message, receiver):
         # Check the current status of the request
         current_status = get_request_status(request_id)
         if current_status and current_status.get("status") in ["completed", "error"]:
-            logger.info(f"Request {request_id} is already {current_status.get('status')}, skipping")
+            logger.log_with_context(
+                "Request already processed, skipping", 
+                request_id=request_id,
+                status=current_status.get("status")
+            )
             receiver.complete_message(message)
             
             # Remove from active requests
@@ -300,7 +465,12 @@ async def process_message(message, receiver):
                     del active_requests[request_id]
             return
         
-        logger.info(f"Processing request {request_id} for user {user_email}")
+        logger.log_with_context(
+            "Processing request", 
+            request_id=request_id,
+            user_email=user_email,
+            request_type=request_type
+        )
         
         # Update the request status to processing
         update_request_status(request_id, "processing")
@@ -311,7 +481,9 @@ async def process_message(message, receiver):
             question=question,
             assistant_id=assistant_id,
             thread_id=thread_id,
-            user_email=user_email
+            user_email=user_email,
+            request_type=request_type,
+            report_name=report_name
         )
         
         # Update the status based on the result
@@ -321,11 +493,24 @@ async def process_message(message, receiver):
         # Complete the message to remove it from the queue
         receiver.complete_message(message)
         
-        logger.info(f"Completed processing request {request_id}")
+        # Calculate total processing time
+        total_duration = time.time() - start_time
+        logger.log_with_context(
+            "Completed processing request", 
+            request_id=request_id,
+            user_email=user_email,
+            duration=total_duration,
+            status=status
+        )
         
     except Exception as e:
-        logger.error(f"Error processing message: {str(e)}")
-        logger.error(traceback.format_exc())
+        logger.error_with_context(
+            "Error processing message", 
+            request_id=request_id,
+            user_email=user_email if 'user_email' in locals() else None,
+            exc_info=True,
+            error=str(e)
+        )
         
         # Update status if we have a request_id
         if request_id:
@@ -345,6 +530,10 @@ async def process_message(message, receiver):
             with active_requests_lock:
                 if request_id in active_requests:
                     del active_requests[request_id]
+                    
+        # Ensure any pending conversations are flushed in case of exceptions
+        if len(pending_conversations) > 0:
+            maybe_flush_conversation_batch()
 
 def run_async_in_thread(async_func, *args):
     """
@@ -363,41 +552,139 @@ def process_message_in_thread(message, receiver):
     """
     return run_async_in_thread(process_message, message, receiver)
 
+async def check_assistant_inactivity(assistant_id):
+    """
+    Check if an assistant has been inactive for more than the inactivity timeout
+    
+    Args:
+        assistant_id (str): The assistant ID to check
+        
+    Returns:
+        bool: True if the assistant is inactive and should be deleted, False otherwise
+    """
+    last_activity = get_assistant_last_activity(assistant_id)
+    
+    # If no activity found, use the cache's last_used time as fallback
+    if last_activity is None:
+        with assistant_cache_lock:
+            for user_email, info in assistant_cache.items():
+                if info.get("assistant_id") == assistant_id:
+                    last_activity = info.get("last_used")
+                    break
+    
+    if last_activity is None:
+        # If still no activity info, assume it's inactive
+        return True
+    
+    current_time = time.time()
+    time_since_last_activity = current_time - last_activity
+    
+    return time_since_last_activity > ASSISTANT_INACTIVITY_TIMEOUT
+
 def cleanup_task():
     """
-    Periodically clean up old requests
+    Periodically clean up old requests and inactive assistants
     """
     global last_cleanup_time
     
     current_time = time.time()
     time_since_last_cleanup = current_time - last_cleanup_time
     
+    # Ensure all pending conversations are flushed first
+    if len(pending_conversations) > 0:
+        maybe_flush_conversation_batch()
+    
     # Convert hours to seconds for comparison
     cleanup_interval_seconds = CLEANUP_INTERVAL_HOURS * 3600
     
     if time_since_last_cleanup >= cleanup_interval_seconds:
-        logger.info(f"Running cleanup task for requests older than {CLEANUP_DAYS} days")
+        logger.log_with_context(
+            f"Running cleanup task",
+            cleanup_days=CLEANUP_DAYS
+        )
         try:
+            # Clean up old requests
             deleted_items = cleanup_old_requests(CLEANUP_DAYS)
-            logger.info(f"Cleaned up {len(deleted_items)} old requests")
+            logger.log_with_context(
+                "Cleaned up old requests",
+                count=len(deleted_items)
+            )
+            
+            # Clean up old conversations (keep for 30 days by default)
+            deleted_conversations = cleanup_old_conversations(30)
+            logger.log_with_context(
+                "Cleaned up old conversations",
+                count=deleted_conversations
+            )
+            
+            # Update last cleanup time
             last_cleanup_time = current_time
             
-            # Also clean up old assistant cache entries
+            # Clean up assistant cache entries and inactive assistants
             with assistant_cache_lock:
-                current_time = time.time()
+                # First, collect assistants that should be deleted
+                assistants_to_delete = []
                 expired_keys = []
+                
                 for user_email, info in assistant_cache.items():
-                    if current_time - info.get("last_used", 0) > 3600:  # 1 hour expiry
+                    assistant_id = info.get("assistant_id")
+                    
+                    # Check inactivity
+                    is_inactive = run_async_in_thread(check_assistant_inactivity, assistant_id)
+                    
+                    if is_inactive:
+                        logger.log_with_context(
+                            "Assistant inactive, marking for deletion",
+                            assistant_id=assistant_id,
+                            user_email=user_email
+                        )
+                        assistants_to_delete.append(assistant_id)
                         expired_keys.append(user_email)
                 
+                # Now delete the assistants from Azure OpenAI
+                for assistant_id in assistants_to_delete:
+                    try:
+                        logger.log_with_context(
+                            "Deleting inactive assistant",
+                            assistant_id=assistant_id
+                        )
+                        result = run_async_in_thread(delete_assistant, assistant_id)
+                        if result.get("status") == "success":
+                            logger.log_with_context(
+                                "Successfully deleted assistant",
+                                assistant_id=assistant_id
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to delete assistant",
+                                assistant_id=assistant_id,
+                                error=result.get('message')
+                            )
+                    except Exception as e:
+                        logger.error_with_context(
+                            "Error deleting assistant",
+                            assistant_id=assistant_id,
+                            exc_info=True,
+                            error=str(e)
+                        )
+                
+                # Finally remove the expired entries from the cache
                 for key in expired_keys:
-                    del assistant_cache[key]
+                    if key in assistant_cache:
+                        del assistant_cache[key]
                 
                 if expired_keys:
-                    logger.info(f"Cleaned up {len(expired_keys)} expired assistant cache entries")
+                    logger.log_with_context(
+                        "Cleaned up expired assistant cache entries",
+                        count=len(expired_keys)
+                    )
                 
         except Exception as e:
-            logger.error(f"Error during cleanup task: {str(e)}")
+            logger.error_with_context(
+                "Error during cleanup task",
+                exc_info=True,
+                error=str(e)
+            )
 
 def main():
     """
@@ -409,53 +696,110 @@ def main():
         logger.error("Azure Service Bus connection string is not set!")
         return
     
-    logger.info(f"Starting message processing with {MAX_WORKERS} workers")
-    logger.info(f"Connecting to queue: {AZURE_SERVICE_BUS_QUEUE_NAME}")
+    logger.log_with_context(
+        "Starting message processing",
+        workers=MAX_WORKERS,
+        queue=AZURE_SERVICE_BUS_QUEUE_NAME,
+        database_type=DATABASE_TYPE
+    )
     
     # Initialize last_cleanup_time
     last_cleanup_time = time.time()
     
+    # Import ServiceBusReceiveMode enum from azure.servicebus
+    from azure.servicebus import ServiceBusReceiveMode
+    
     # Create ServiceBusClient
     servicebus_client = ServiceBusClient.from_connection_string(AZURE_SERVICE_BUS_CONNECTION_STRING)
     
-    # Create a receiver in peek-lock mode (default) so we can complete/abandon messages
+    # Create a receiver in peek-lock mode using the proper enum value
     receiver = servicebus_client.get_queue_receiver(
         queue_name=AZURE_SERVICE_BUS_QUEUE_NAME,
-        max_wait_time=MAX_WAIT_TIME
+        max_wait_time=MAX_WAIT_TIME,
+        receive_mode=ServiceBusReceiveMode.PEEK_LOCK,  # Use enum instead of integer 1
+        prefetch_count=MAX_MESSAGE_COUNT  # Prefetch to improve throughput
     )
+    
+    # Monitor metrics for processor health
+    message_count = 0
+    error_count = 0
+    start_time = time.time()
     
     # Create thread pool for parallel processing
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         try:
-            logger.info("Starting message processing loop")
+            logger.log_with_context("Starting message processing loop")
             while True:
                 # Run cleanup task
                 cleanup_task()
                 
-                # Receive batch of messages
-                messages = receiver.receive_messages(
-                    max_message_count=MAX_MESSAGE_COUNT,
-                    max_wait_time=MAX_WAIT_TIME
-                )
+                try:
+                    # Receive batch of messages
+                    messages = receiver.receive_messages(
+                        max_message_count=MAX_MESSAGE_COUNT,
+                        max_wait_time=MAX_WAIT_TIME
+                    )
+                    
+                    if messages:
+                        batch_size = len(messages)
+                        message_count += batch_size
+                        logger.log_with_context(
+                            "Received messages batch",
+                            count=batch_size,
+                            total_processed=message_count
+                        )
+                        
+                        # Submit each message to the thread pool
+                        for message in messages:
+                            executor.submit(process_message_in_thread, message, receiver)
+                    else:
+                        # No messages, sleep briefly before polling again
+                        time.sleep(1)
+                        
+                    # Log metrics periodically (every hour)
+                    current_time = time.time()
+                    if current_time - start_time > 3600:  # 1 hour
+                        uptime = current_time - start_time
+                        logger.log_with_context(
+                            "Processor metrics",
+                            uptime_hours=round(uptime / 3600, 2),
+                            messages_processed=message_count,
+                            errors=error_count,
+                            messages_per_hour=round(message_count / (uptime / 3600), 2),
+                            active_requests=len(active_requests),
+                            cached_assistants=len(assistant_cache)
+                        )
+                        # Reset counters but keep start_time for uptime calculation
+                        message_count = 0
+                        error_count = 0
+                        
+                except Exception as batch_error:
+                    error_count += 1
+                    logger.error_with_context(
+                        "Error receiving messages batch",
+                        exc_info=True,
+                        error=str(batch_error)
+                    )
+                    # Brief pause to avoid tight loop in case of persistent errors
+                    time.sleep(5)
                 
-                if messages:
-                    logger.info(f"Received {len(messages)} messages")
-                    # Submit each message to the thread pool
-                    for message in messages:
-                        executor.submit(process_message_in_thread, message, receiver)
-                else:
-                    # No messages, sleep briefly before polling again
-                    time.sleep(1)
         except KeyboardInterrupt:
-            logger.info("Stopping message processing due to keyboard interrupt")
+            logger.log_with_context("Stopping message processing due to keyboard interrupt")
         except Exception as e:
-            logger.error(f"Error in message processing loop: {str(e)}")
-            logger.error(traceback.format_exc())
+            logger.error_with_context(
+                "Error in message processing loop",
+                exc_info=True,
+                error=str(e)
+            )
         finally:
-            logger.info("Closing receiver and client connections")
+            # Flush any remaining conversations
+            if len(pending_conversations) > 0:
+                maybe_flush_conversation_batch()
+                
+            logger.log_with_context("Closing receiver and client connections")
             receiver.close()
             servicebus_client.close()
 
 if __name__ == "__main__":
-    logger.info("NL2SQL Queue Processor starting up")
+    logger.log_with_context("NL2SQL Queue Processor starting up")
     main()

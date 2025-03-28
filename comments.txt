@@ -44,3 +44,5 @@ chmod +x cosmos-setup.sh
 chmod +x deploy-container.sh
 
 az container update --resource-group exquitech-ai-rg --name nl2sql-processor --cpu 4 --memory 8
+
+brew install jq

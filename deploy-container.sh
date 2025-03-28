@@ -15,6 +15,10 @@ MEMORY="4"
 REGISTRY_USERNAME=""  # Will be set later
 REGISTRY_PASSWORD=""  # Will be set later
 
+# Create logs storage
+STORAGE_ACCOUNT_NAME="insightshqlogs"
+STORAGE_SHARE_NAME="nl2sql-logs"
+
 # Environment variables from .env file
 ENV_FILE=".env"
 
@@ -46,20 +50,39 @@ LOGIN_SERVER=$(az acr show --name $ACR_NAME --resource-group $RESOURCE_GROUP --q
 echo "Building and pushing Docker image to ACR..."
 az acr build --registry $ACR_NAME --image $IMAGE_NAME:$IMAGE_TAG .
 
-# Create an array of environment variables for the container
+# Create a storage account for logs if it doesn't exist
+echo "Setting up storage for logs..."
+az storage account show --name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP &>/dev/null || \
+    az storage account create --name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --location $LOCATION --sku Standard_LRS
+
+# Get storage account key
+STORAGE_KEY=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME --resource-group $RESOURCE_GROUP --query "[0].value" -o tsv)
+
+# Create a file share for logs if it doesn't exist
+az storage share exists --name $STORAGE_SHARE_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key "$STORAGE_KEY" | grep -q "exists.*true" || \
+    az storage share create --name $STORAGE_SHARE_NAME --account-name $STORAGE_ACCOUNT_NAME --account-key "$STORAGE_KEY"
+
+# Create an array of environment variables for the container from .env file
 ENV_VARS=(
     "AZURE_SERVICE_BUS_CONNECTION_STRING=$AZURE_SERVICE_BUS_CONNECTION_STRING"
     "AZURE_SERVICE_BUS_QUEUE_NAME=$AZURE_SERVICE_BUS_QUEUE_NAME"
-    "AZURE_OPENAI_ENDPOINT=$AZURE_OPENAI_ENDPOINT"
-    "AZURE_OPENAI_KEY=$AZURE_OPENAI_KEY"
+    "AZURE_OPENAI_ENDPOINT=$AZURE_OPENAI_API_ENDPOINT"
+    "AZURE_OPENAI_KEY=$AZURE_OPENAI_API_KEY"
     "AZURE_OPENAI_API_VERSION=$AZURE_OPENAI_API_VERSION"
     "AZURE_OPENAI_MODEL_NAME=$AZURE_OPENAI_MODEL_NAME"
     "AZURE_OPENAI_EMBEDDING_MODEL_NAME=$AZURE_OPENAI_EMBEDDING_MODEL_NAME"
     "MONGODB_CONNECTION_STRING=$MONGODB_CONNECTION_STRING"
     "MONGODB_DATABASE_NAME=$MONGODB_DATABASE_NAME"
     "MONGODB_COLLECTION_NAME=$MONGODB_COLLECTION_NAME"
+    "AZURE_OPENAI_API_DEPLOYMENT=$AZURE_OPENAI_API_DEPLOYMENT"
+    "AZURE_TENANT_ID=$AZURE_TENANT_ID"
+    "AZURE_CLIENT_ID=$AZURE_CLIENT_ID"
+    "AZURE_CLIENT_SECRET=$AZURE_CLIENT_SECRET"
+    "AZURE_FABRIC_SQL_SERVER=$AZURE_FABRIC_SQL_SERVER"
+    "AZURE_FABRIC_SQL_WAREHOUSE=$AZURE_FABRIC_SQL_WAREHOUSE"
+    "DATABASE_TYPE=$DB_TYPE"
+    "ENVIRONMENT=production"
     "MAX_WORKERS=20"
-    "DATABASE_TYPE=fabric"
 )
 
 # Convert ENV_VARS array to string for az CLI command
@@ -68,7 +91,7 @@ for var in "${ENV_VARS[@]}"; do
     ENV_STRING="$ENV_STRING --environment-variables $var"
 done
 
-# Create the container instance
+# Create the container instance with volume mount
 echo "Creating Azure Container Instance..."
 az container create \
     --resource-group $RESOURCE_GROUP \
@@ -81,7 +104,12 @@ az container create \
     --cpu $CPU \
     --memory $MEMORY \
     --restart-policy Always \
-    --location $LOCATION
+    --location $LOCATION \
+    --azure-file-volume-account-name $STORAGE_ACCOUNT_NAME \
+    --azure-file-volume-account-key "$STORAGE_KEY" \
+    --azure-file-volume-share-name $STORAGE_SHARE_NAME \
+    --azure-file-volume-mount-path "/app/logs"
 
 echo "Deployment completed successfully!"
 echo "Container logs: az container logs --resource-group $RESOURCE_GROUP --name $CONTAINER_NAME"
+echo "Application logs: Available in Azure Storage File Share '$STORAGE_SHARE_NAME' in account '$STORAGE_ACCOUNT_NAME'"
