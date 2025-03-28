@@ -9,3 +9,6 @@ chromadb
 azure-identity
 instructor
 azure-servicebus
+pymongo
+cachetools>=5.3.0
+requests

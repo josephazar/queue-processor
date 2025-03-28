@@ -21,7 +21,7 @@ class SQLAssistant:
         self.client = self.create_client()
         self.instructions_file_name = instructions_file_name
         self.instructions = self.load_instructions()
-        self.model = os.getenv("GPT4O")
+        self.model = os.getenv("AZURE_OPENAI_API_DEPLOYMENT")
         self.assistant_id = assistant_id
         self.assistant = self.create_assistant()
 
