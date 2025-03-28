@@ -165,12 +165,12 @@ def cache_assistant(user_email, assistant_id, thread_id=None):
             "last_used": time.time()
         }
 
-def maybe_flush_conversation_batch():
+def maybe_flush_conversation_batch(force=True):
     """Check if we have enough pending conversations to do a bulk insert"""
     global pending_conversations
     conversations_to_insert = []
     with pending_conversations_lock:
-        if len(pending_conversations) >= BULK_INSERT_THRESHOLD:
+        if force or len(pending_conversations) >= BULK_INSERT_THRESHOLD:
             conversations_to_insert = pending_conversations[:]
             pending_conversations = []
     
@@ -205,25 +205,13 @@ def maybe_flush_conversation_batch():
                         request_id=conv.get("request_id"),
                         error=str(inner_e)
                     )
-
 async def process_question(request_id, question, assistant_id=None, thread_id=None, user_email=None, request_type=None, report_name=None):
     """
     Process a user question using the NL2SQL assistant.
     This is the core function that communicates with the AI model.
-    
-    Args:
-        request_id (str): Unique identifier for the request
-        question (str): User's natural language question
-        assistant_id (str, optional): ID of an existing assistant to use
-        thread_id (str, optional): ID of an existing conversation thread
-        user_email (str, optional): Email of the user making the request
-        request_type (str, optional): Type of request being made
-        report_name (str, optional): Name of the report if applicable
-        
-    Returns:
-        dict: Response with assistant_id, thread_id, and the answer
     """
     start_time = time.time()
+    assistant_created = False  # Track if we created a new assistant
     
     try:
         logger.log_with_context(
@@ -283,6 +271,7 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             )
             sql_assistant = initialize_assistant(DATABASE_TYPE)
             assistant_id = sql_assistant.assistant.assistant_id
+            assistant_created = True  # Mark that we created a new assistant
             logger.log_with_context(
                 "Created new assistant", 
                 request_id=request_id,
@@ -300,9 +289,8 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
                 assistant_id=assistant_id
             )
         
-        # Update cache with assistant info
-        if user_email:
-            cache_assistant(user_email, assistant_id, thread_id)
+        # Only update cache if everything is successful so far
+        # We'll update the cache at the end if all processing succeeds
         
         # Process the question with a timeout
         try:
@@ -351,6 +339,10 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             # Check if we should do a bulk insert
             maybe_flush_conversation_batch()
             
+            # If we've gotten this far, it's safe to update the cache
+            if user_email:
+                cache_assistant(user_email, assistant_id, thread_id)
+            
             # Calculate total processing time
             total_duration = time.time() - start_time
             logger.log_with_context(
@@ -376,10 +368,26 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
                 exc_info=True,
                 error=str(e)
             )
+            
+            # If we created a new assistant and there was an error, clean it up
+            if assistant_created:
+                try:
+                    logger.log_with_context(
+                        "Cleaning up assistant after error", 
+                        assistant_id=assistant_id
+                    )
+                    await delete_assistant(assistant_id)
+                except Exception as cleanup_error:
+                    logger.error_with_context(
+                        "Failed to clean up assistant after error", 
+                        assistant_id=assistant_id,
+                        error=str(cleanup_error)
+                    )
+            
             return {
                 "status": "error",
                 "message": f"Error processing question: {str(e)}",
-                "assistant_id": assistant_id,
+                "assistant_id": None if assistant_created else assistant_id,
                 "thread_id": thread_id
             }
     
@@ -391,13 +399,29 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             exc_info=True,
             error=str(e)
         )
+        
+        # If we created a new assistant and there was an error, clean it up
+        if assistant_created:
+            try:
+                logger.log_with_context(
+                    "Cleaning up assistant after error", 
+                    assistant_id=assistant_id
+                )
+                await delete_assistant(assistant_id)
+            except Exception as cleanup_error:
+                logger.error_with_context(
+                    "Failed to clean up assistant after error", 
+                    assistant_id=assistant_id,
+                    error=str(cleanup_error)
+                )
+        
         return {
             "status": "error",
             "message": f"Error processing question: {str(e)}",
-            "assistant_id": assistant_id,
+            "assistant_id": None if assistant_created else assistant_id,
             "thread_id": thread_id
         }
-
+    
 async def process_message(message, receiver):
     """
     Process a single message from the queue with improved thread safety
@@ -531,9 +555,8 @@ async def process_message(message, receiver):
                 if request_id in active_requests:
                     del active_requests[request_id]
                     
-        # Ensure any pending conversations are flushed in case of exceptions
-        if len(pending_conversations) > 0:
-            maybe_flush_conversation_batch()
+        # Force flush any pending conversations regardless of count
+        maybe_flush_conversation_batch(force=True)
 
 def run_async_in_thread(async_func, *args):
     """

@@ -46,3 +46,11 @@ chmod +x deploy-container.sh
 az container update --resource-group exquitech-ai-rg --name nl2sql-processor --cpu 4 --memory 8
 
 brew install jq
+
+
+docker build -t insightshq-agent-processor:latest .
+docker run -it --env-file .env insightshq-agent-processor:latest
+
+
+docker pull insightshqagentqueueacr.azurecr.io/insightshq-agent-processor:latest
+docker run -it --env-file .env insightshqagentqueueacr.azurecr.io/insightshq-agent-processor:latest

@@ -4,9 +4,9 @@ set -e
 # Configuration
 RESOURCE_GROUP="exquitech-ai-rg"
 LOCATION="uaenorth"
-ACR_NAME="insightshq-queue-acr"  # Must be globally unique
-CONTAINER_NAME="nl2sql-processor"
-IMAGE_NAME="nl2sql-processor"
+ACR_NAME="insightshqagentqueueacr"  # Must be globally unique
+CONTAINER_NAME="insightshq-agent-processor"
+IMAGE_NAME="insightshq-agent-processor"
 IMAGE_TAG="latest"
 
 # Container instance settings
@@ -24,7 +24,21 @@ ENV_FILE=".env"
 
 echo "Loading environment variables from $ENV_FILE..."
 if [ -f "$ENV_FILE" ]; then
-    export $(grep -v '^#' "$ENV_FILE" | xargs)
+    while IFS='=' read -r key value; do
+        # Skip empty lines and comments
+        if [[ -z "$key" || "$key" =~ ^# ]]; then
+            continue
+        fi
+        # Remove any surrounding quotes from the value
+        value="${value%\"}"
+        value="${value#\"}"
+        # Export valid variables only
+        if [[ "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+            export "$key=$value"
+        else
+            echo "Warning: Invalid variable name in .env file: $key"
+        fi
+    done < "$ENV_FILE"
 else
     echo "Error: $ENV_FILE not found"
     exit 1
@@ -93,22 +107,47 @@ done
 
 # Create the container instance with volume mount
 echo "Creating Azure Container Instance..."
+# Load .env variables
+ENV_FILE=".env"
+ENV_VARS_FORMATTED=()
+while IFS='=' read -r key value; do
+    # Clean up key and value (remove whitespace and carriage returns)
+    key=$(echo "$key" | sed 's/^[ \t]*//;s/[ \t\r]*$//')
+    value=$(echo "$value" | sed 's/^[ \t]*//;s/[ \t\r]*$//')
+    echo "Processing: key='$key', value='$value'"  # Debug output
+    if [[ -n "$key" && ! "$key" =~ ^# && "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+        ENV_VARS_FORMATTED+=("$key=$value")
+        echo "Added: $key=$value"  # Debug output
+    else
+        echo "Skipped: $key"  # Debug output
+    fi
+done < "$ENV_FILE"
+
+# Print the array contents
+echo "Environment variables:"
+for var in "${ENV_VARS_FORMATTED[@]}"; do
+    echo "$var"
+done
+
+# Create or update the container instance
+echo "Creating/updating Azure Container Instance..."
 az container create \
     --resource-group $RESOURCE_GROUP \
     --name $CONTAINER_NAME \
     --image $LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG \
+    --os-type Linux \
     --registry-login-server $LOGIN_SERVER \
     --registry-username $REGISTRY_USERNAME \
     --registry-password $REGISTRY_PASSWORD \
-    $ENV_STRING \
+    --environment-variables "${ENV_VARS_FORMATTED[@]}" \
     --cpu $CPU \
     --memory $MEMORY \
     --restart-policy Always \
-    --location $LOCATION \
     --azure-file-volume-account-name $STORAGE_ACCOUNT_NAME \
     --azure-file-volume-account-key "$STORAGE_KEY" \
     --azure-file-volume-share-name $STORAGE_SHARE_NAME \
     --azure-file-volume-mount-path "/app/logs"
+
 
 echo "Deployment completed successfully!"
 echo "Container logs: az container logs --resource-group $RESOURCE_GROUP --name $CONTAINER_NAME"

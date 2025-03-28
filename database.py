@@ -45,7 +45,7 @@ class CosmosDBManager:
                 connectTimeoutMS=5000,  # 5 seconds connection timeout
                 socketTimeoutMS=30000,  # 30 seconds socket timeout
                 serverSelectionTimeoutMS=5000,  # 5 seconds server selection timeout
-                retryWrites=True,  # Enable retry for write operations
+                retryWrites=False,  # CHANGE: Disable retry for write operations
                 w='majority',  # Write concern for data durability
                 waitQueueTimeoutMS=5000  # 5 seconds wait queue timeout
             )

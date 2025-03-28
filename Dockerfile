@@ -1,11 +1,21 @@
+#FROM --platform=linux/amd64 python:3.10
 FROM python:3.10
 
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y \
+    unixodbc \
+    unixodbc-dev \
+    libodbc1 \
+    gcc \
+    g++ \
+    curl \
+    gnupg \
+    && curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - \
+    && curl https://packages.microsoft.com/config/debian/10/prod.list > /etc/apt/sources.list.d/mssql-release.list \
+    && apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql17 \
+    && apt-get clean
 
 # Copy requirements first for better caching
 COPY requirements.txt .
