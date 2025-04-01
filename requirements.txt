@@ -1,0 +1,14 @@
+openai>=1.37.1, <2.0.0
+python-dotenv>=1.0.1, <2.0.0
+azure-search-documents==11.4.0
+azure-core
+sqlalchemy
+pandas
+pyodbc
+chromadb
+azure-identity
+instructor
+azure-servicebus
+pymongo
+cachetools>=5.3.0
+requests

@@ -1,0 +1,122 @@
+{
+    "table": "BudgetingView",
+    "description": "The BudgetingView table provides a comprehensive view of budgeting and financial allocations within an organization. It integrates budget entries with relevant metadata, including company details, department information, financial accounts, posting accounts, and salesperson data. Each entry represents a budgeted transaction linked to a specific time period, categorized by fiscal year, month, and quarter. The table also includes descriptive fields such as document numbers, budget titles, and detailed descriptions to provide context for financial planning. By joining data from various dimensions—such as general ledger accounts, posting accounts, and budget categories—the BudgetingView table enables deep analysis of financial trends, departmental budget allocations, and company-wide expenditure planning. This dataset is ideal for generating reports, tracking budget utilization, forecasting financial performance, and performing variance analysis across different business units and geographies.",
+    "datasource": "ds2-insights-demo-warehouse",
+    "columns": [
+        {
+            "name": "DocumentNo",
+            "description": "Unique identifier for the budget document.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "CompanyID",
+            "description": "Unique identifier for the company associated with the budget entry.",
+            "type": "bigint"
+        },
+        {
+            "name": "Company_Name",
+            "description": "Name of the company associated with the budget entry.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "CountryID",
+            "description": "Unique identifier for the country where the budget entry is recorded.",
+            "type": "bigint"
+        },
+        {
+            "name": "Country_Name",
+            "description": "Country where the budget entry is recorded.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "DeptID",
+            "description": "Unique identifier for the department responsible for the budget allocation.",
+            "type": "bigint"
+        },
+        {
+            "name": "Department_Name",
+            "description": "Department responsible for the budget allocation.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "AccountID",
+            "description": "Unique identifier for the General Ledger account associated with the budget.",
+            "type": "bigint"
+        },
+        {
+            "name": "GL_Account_Name",
+            "description": "General Ledger account name associated with the budget.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "PostingAccountID",
+            "description": "Unique identifier for the posting account linked to the budget transaction.",
+            "type": "bigint"
+        },
+        {
+            "name": "Posting_Account_Name",
+            "description": "Name of the posting account linked to the budget transaction.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "SalespersonID",
+            "description": "Unique identifier for the salesperson related to the budgeted transaction.",
+            "type": "bigint"
+        },
+        {
+            "name": "SalesPerson_Name",
+            "description": "Salesperson related to the budgeted transaction.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "Date",
+            "description": "Date of the budget entry.",
+            "type": "datetime2"
+        },
+        {
+            "name": "Year",
+            "description": "Fiscal year associated with the budget.",
+            "type": "bigint"
+        },
+        {
+            "name": "Month",
+            "description": "Numeric representation of the month in the fiscal year.",
+            "type": "bigint"
+        },
+        {
+            "name": "Quarter",
+            "description": "Fiscal quarter corresponding to the budget entry.",
+            "type": "bigint"
+        },
+        {
+            "name": "Description",
+            "description": "Detailed description of the budget entry.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "Title",
+            "description": "Title or label for the budget entry.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "CategoryID",
+            "description": "Unique identifier for the category of the budget entry.",
+            "type": "bigint"
+        },
+        {
+            "name": "Budget_Category",
+            "description": "Category of the budget entry, such as marketing, operations, or sales.",
+            "type": "varchar(8000)"
+        },
+        {
+            "name": "ActualNumber",
+            "description": "Actual amount recorded for the budget entry.",
+            "type": "decimal(18,2)"
+        },
+        {
+            "name": "BudgetNumber",
+            "description": "Planned or budgeted amount for the entry.",
+            "type": "decimal(18,2)"
+        }
+    ]
+}

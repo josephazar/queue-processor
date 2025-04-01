@@ -1,0 +1,32 @@
+[
+    {
+        "datasource": "ds2-insights-demo-warehouse",
+        "question": "What is the total budget allocation by department for the current fiscal year?",
+        "query": "SELECT TOP 50 Department_Name, SUM(BudgetNumber) AS Total_Budget FROM BudgetingView WHERE Year = YEAR(GETDATE()) GROUP BY Department_Name ORDER BY Total_Budget DESC",
+        "reasoning": "This query calculates the total budget allocation per department for the current fiscal year."
+    },
+    {
+        "datasource": "ds2-insights-demo-warehouse",
+        "question": "Which departments exceeded their budget last quarter?",
+        "query": "SELECT TOP 50 Department_Name, SUM(ActualNumber) AS Total_Spending, SUM(BudgetNumber) AS Allocated_Budget FROM BudgetingView WHERE Quarter = (SELECT MAX(Quarter) FROM BudgetingView WHERE Year = YEAR(GETDATE())) GROUP BY Department_Name HAVING SUM(ActualNumber) > SUM(BudgetNumber) ORDER BY Total_Spending DESC",
+        "reasoning": "This query finds departments that exceeded their budget in the last quarter by comparing actual spending to allocated budget."
+    },
+    {
+        "datasource": "ds2-insights-demo-warehouse",
+        "question": "What are the top 10 budgeted projects for this year?",
+        "query": "SELECT TOP 50 Title AS Project_Name, BudgetNumber FROM BudgetingView WHERE Year = YEAR(GETDATE()) ORDER BY BudgetNumber DESC",
+        "reasoning": "This query identifies the top 10 projects with the highest budget allocations in the current year."
+    },
+    {
+        "datasource": "ds2-insights-demo-warehouse",
+        "question": "What is the total budget allocation per country?",
+        "query": "SELECT TOP 50 Country_Name, SUM(BudgetNumber) AS Total_Budget FROM BudgetingView GROUP BY Country_Name ORDER BY Total_Budget DESC",
+        "reasoning": "This query aggregates the total budget allocation for each country."
+    },
+    {
+        "datasource": "ds2-insights-demo-warehouse",
+        "question": "Which salespeople have the highest budget allocations?",
+        "query": "SELECT TOP 50 SalesPerson_Name, SUM(BudgetNumber) AS Total_Budget FROM BudgetingView GROUP BY SalesPerson_Name ORDER BY Total_Budget DESC",
+        "reasoning": "This query retrieves salespeople with the highest assigned budgets."
+    }
+]
