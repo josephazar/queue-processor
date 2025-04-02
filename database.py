@@ -23,6 +23,7 @@ class CosmosDBManager:
     _db = None
     _collection = None
     _conversation_collection = None
+    _health_collection = None
     
     @classmethod
     def get_instance(cls):
@@ -56,6 +57,7 @@ class CosmosDBManager:
             self._db = self._client[MONGODB_DATABASE_NAME]
             self._collection = self._db[MONGODB_COLLECTION_NAME]
             self._conversation_collection = self._db["conversations"]
+            self._health_collection = self._db["container_health"]
             
             # Create indexes if needed for requests collection
             self._collection.create_index("request_id", unique=True)
@@ -83,6 +85,11 @@ class CosmosDBManager:
                 ("updated_at", pymongo.DESCENDING)
             ])
             
+            # Create indexes for health collection
+            self._health_collection.create_index("timestamp")
+            self._health_collection.create_index("error_type")
+            self._health_collection.create_index("container_id")
+            
             logger.info(f"MongoDB connection initialized successfully to database: {MONGODB_DATABASE_NAME}")
             
         except ConnectionFailure as e:
@@ -99,6 +106,10 @@ class CosmosDBManager:
     def get_conversation_collection(self):
         """Get the MongoDB collection for conversation history"""
         return self._conversation_collection
+    
+    def get_health_collection(self):
+        """Get the MongoDB collection for container health logs"""
+        return self._health_collection
     
     def close(self):
         """Close the MongoDB connection"""
@@ -131,6 +142,39 @@ def db_operation_with_retry(func):
             logger.error(f"Unexpected error in {func.__name__}: {str(e)}")
             raise
     return wrapper
+
+# New function for container health logging
+@db_operation_with_retry
+def log_container_health_issue(error_type, details):
+    """
+    Log container health issues directly to Cosmos DB
+    
+    Args:
+        error_type (str): Type of error or health event
+        details (str): Details about the error or event
+    """
+    try:
+        collection = CosmosDBManager.get_instance().get_health_collection()
+        
+        # Format the document
+        document = {
+            "type": "container_health",
+            "error_type": error_type,
+            "details": details,
+            "timestamp": int(time.time()),
+            "container_id": os.environ.get("HOSTNAME", "unknown")
+        }
+        
+        # Insert the document
+        collection.insert_one(document)
+        
+        logger.debug(f"Logged container health issue: {error_type}")
+        return True
+        
+    except Exception as e:
+        # Log to console/file if we can't log to DB
+        logger.error(f"Failed to log container health issue to Cosmos DB: {str(e)}")
+        return False
 
 # Request data access functions
 @db_operation_with_retry
@@ -374,6 +418,22 @@ def cleanup_old_conversations(days=30):
     logger.info(f"Cleaned up {result.deleted_count} conversations older than {days} days")
     return result.deleted_count
 
+@db_operation_with_retry
+def cleanup_old_health_logs(days=7):
+    """
+    Delete health logs older than specified days with retry logic
+    """
+    collection = CosmosDBManager.get_instance().get_health_collection()
+    
+    # Calculate cutoff timestamp
+    cutoff_timestamp = int(time.time()) - (days * 24 * 60 * 60)
+    
+    # Delete old health logs
+    result = collection.delete_many({"timestamp": {"$lt": cutoff_timestamp}})
+    
+    logger.info(f"Cleaned up {result.deleted_count} health logs older than {days} days")
+    return result.deleted_count
+
 # Bulk operations for better performance
 @db_operation_with_retry
 def bulk_store_conversations(conversations):
@@ -392,3 +452,40 @@ def bulk_store_conversations(conversations):
     collection = CosmosDBManager.get_instance().get_conversation_collection()
     result = collection.insert_many(conversations)
     return len(result.inserted_ids)
+
+# Add methods to query container health
+@db_operation_with_retry
+def get_container_health_history(container_id=None, error_type=None, limit=50):
+    """
+    Get container health history with optional filters
+    
+    Args:
+        container_id (str, optional): Filter by container ID
+        error_type (str, optional): Filter by error type
+        limit (int): Maximum number of records to return
+        
+    Returns:
+        list: List of health records
+    """
+    collection = CosmosDBManager.get_instance().get_health_collection()
+    
+    # Build filter
+    filter_dict = {}
+    if container_id:
+        filter_dict["container_id"] = container_id
+    if error_type:
+        filter_dict["error_type"] = error_type
+    
+    # Find documents
+    cursor = collection.find(filter_dict).sort("timestamp", pymongo.DESCENDING).limit(limit)
+    
+    # Convert to list
+    documents = []
+    for doc in cursor:
+        # Convert MongoDB document to dict and convert ObjectId to string
+        doc = dict(doc)
+        if "_id" in doc:
+            doc["_id"] = str(doc["_id"])
+        documents.append(doc)
+        
+    return documents

@@ -22,33 +22,42 @@ STORAGE_KEY=$(az storage account keys list --account-name $STORAGE_ACCOUNT_NAME 
 echo "Registry username: $REGISTRY_USERNAME"
 echo "Registry password: $REGISTRY_PASSWORD"
 
+# Ensure healthcheck.sh is executable
+chmod +x healthcheck.sh
+
 # Build and push the Docker image to ACR
 echo "Building and pushing Docker image to ACR..."
 az acr build --registry $ACR_NAME --image $IMAGE_NAME:$IMAGE_TAG .
 
-
 # Load .env variables
 ENV_FILE=".env"
 ENV_VARS_FORMATTED=()
-while IFS='=' read -r key value; do
-    # Clean up key and value (remove whitespace and carriage returns)
-    key=$(echo "$key" | sed 's/^[ \t]*//;s/[ \t\r]*$//')
-    echo "Raw value: '$value'"
-    value=$(echo "$value" | sed 's/^[ \t]*//;s/[ \t\r]*$//')
-    echo "Processed value: '$value'"
-    echo "Processing: key='$key', value='$value'"  # Debug output
-    
-    # Hardcode the embedding model name variable if this is that key
-    if [[ "$key" == "AZURE_OPENAI_EMBEDDING_MODEL_NAME" ]]; then
-        value="textembedding-test-exquitech"
-        echo "Overriding embedding model name to: $value"
+
+while IFS= read -r line; do
+    # Skip empty lines and comments
+    if [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]]; then
+        continue
     fi
     
-    if [[ -n "$key" && ! "$key" =~ ^# && "$key" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+    # Extract key and value
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+        key="${BASH_REMATCH[1]}"
+        value="${BASH_REMATCH[2]}"
+        
+        # Remove any surrounding quotes from the value
+        value="${value%\"}"
+        value="${value#\"}"
+        value="${value%\'}"
+        value="${value#\'}"
+        
+        # Trim any trailing whitespace
+        value=$(echo "$value" | sed 's/[[:space:]]*$//')
+        
+        echo "Processing: key='$key', value='$value'"  # Debug output
         ENV_VARS_FORMATTED+=("$key=$value")
         echo "Added: $key=$value"  # Debug output
     else
-        echo "Skipped: $key"  # Debug output
+        echo "Skipped line: $line"  # Debug output
     fi
 done < "$ENV_FILE"
 
@@ -58,15 +67,13 @@ for var in "${ENV_VARS_FORMATTED[@]}"; do
     echo "$var"
 done
 
-
 # Check if the container group exists and delete it if it does
 if az container show --resource-group $RESOURCE_GROUP --name $CONTAINER_NAME --query id --output tsv > /dev/null 2>&1; then
     echo "Container group exists, deleting..."
     az container delete --resource-group $RESOURCE_GROUP --name $CONTAINER_NAME --yes
 fi
 
-
-# Create or update the container instance
+# Create the container instance with volume mount and health probes
 echo "Creating/updating Azure Container Instance..."
 az container create \
     --resource-group $RESOURCE_GROUP \
@@ -83,6 +90,11 @@ az container create \
     --azure-file-volume-account-name $STORAGE_ACCOUNT_NAME \
     --azure-file-volume-account-key "$STORAGE_KEY" \
     --azure-file-volume-share-name $STORAGE_SHARE_NAME \
-    --azure-file-volume-mount-path "/app/logs"
+    --azure-file-volume-mount-path "/app/logs" \
+    --dns-name-label $CONTAINER_NAME-dns \
+    --command-line "/app/healthcheck.sh"
 
 echo "Container deployment completed!"
+echo "Container logs: az container logs --resource-group $RESOURCE_GROUP --name $CONTAINER_NAME"
+echo "Application logs: Available in Azure Storage File Share '$STORAGE_SHARE_NAME' in account '$STORAGE_ACCOUNT_NAME'"
+echo "Container health status: az container show --resource-group $RESOURCE_GROUP --name $CONTAINER_NAME --query containers[0].instanceView.currentState.state"

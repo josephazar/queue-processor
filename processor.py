@@ -687,11 +687,11 @@ def run_async_in_thread(async_func, *args):
     finally:
         loop.close()
 
-def process_message_in_thread(message, receiver):
+def process_message_in_thread(message, action_queue):
     """
     Wrapper to process message in a thread
     """
-    return run_async_in_thread(process_message, message, receiver)
+    return run_async_in_thread(process_message, message, action_queue)
 
 async def check_assistant_inactivity(assistant_id):
     """
@@ -890,3 +890,156 @@ def main():
                 
                 # Monitor thread health
                 monitor_thread_health(executor)
+                
+                try:
+                    # Use context manager for proper connection handling
+                    servicebus_client = ServiceBusClient.from_connection_string(
+                        AZURE_SERVICE_BUS_CONNECTION_STRING
+                    )
+                    with servicebus_client:
+                        with servicebus_client.get_queue_receiver(
+                            queue_name=AZURE_SERVICE_BUS_QUEUE_NAME,
+                            max_wait_time=MAX_WAIT_TIME,
+                            receive_mode=ServiceBusReceiveMode.PEEK_LOCK,
+                            prefetch_count=MAX_MESSAGE_COUNT
+                        ) as receiver:
+                            # New shared queue for message completion actions
+                            message_actions = []
+                            
+                            # Receive batch of messages
+                            messages = receiver.receive_messages(
+                                max_message_count=MAX_MESSAGE_COUNT,
+                                max_wait_time=MAX_WAIT_TIME
+                            )
+                            
+                            if messages:
+                                # Reset connection error counter on successful message receipt
+                                consecutive_connection_errors = 0
+                                last_message_received = time.time()
+                                
+                                batch_size = len(messages)
+                                message_count += batch_size
+                                logger.log_with_context(
+                                    "Received messages batch",
+                                    count=batch_size,
+                                    total_processed=message_count
+                                )
+                                
+                                # Submit each message to the thread pool and collect futures
+                                futures = []
+                                for message in messages:
+                                    futures.append(executor.submit(process_message_in_thread, message, message_actions))
+                                
+                                # Wait for all futures to complete
+                                concurrent.futures.wait(futures)
+                                
+                                # Process message actions in the main thread where the receiver is valid
+                                with message_actions_lock:
+                                    for message, action in message_actions:
+                                        try:
+                                            if action == 'complete':
+                                                receiver.complete_message(message)
+                                            elif action == 'abandon':
+                                                receiver.abandon_message(message)
+                                        except Exception as e:
+                                            logger.error(f"Error performing message action {action}: {str(e)}")
+                                    
+                                    # Clear the action queue
+                                    message_actions.clear()
+                            else:
+                                # No messages, sleep briefly before polling again
+                                time.sleep(1)
+                    
+                    # Log metrics periodically (every hour)
+                    current_time = time.time()
+                    if current_time - start_time > 3600:  # 1 hour
+                        uptime = current_time - start_time
+                        logger.log_with_context(
+                            "Processor metrics",
+                            uptime_hours=round(uptime / 3600, 2),
+                            messages_processed=message_count,
+                            errors=error_count,
+                            messages_per_hour=round(message_count / (uptime / 3600), 2),
+                            active_requests=len(active_requests),
+                            cached_assistants=len(assistant_cache),
+                            connection_errors=consecutive_connection_errors
+                        )
+                        
+                        # Also log health metrics to Cosmos DB
+                        log_container_health_issue("metrics", json.dumps({
+                            "uptime_hours": round(uptime / 3600, 2),
+                            "messages_processed": message_count,
+                            "errors": error_count,
+                            "active_requests": len(active_requests),
+                            "cached_assistants": len(assistant_cache),
+                            "connection_errors": consecutive_connection_errors
+                        }))
+                        
+                        # Reset counters but keep start_time for uptime calculation
+                        message_count = 0
+                        error_count = 0
+                
+                except (ServiceBusConnectionError, ServiceBusError) as sbe:
+                    error_count += 1
+                    consecutive_connection_errors += 1
+                    logger.error_with_context(
+                        "Service Bus connection error",
+                        exc_info=True,
+                        error=str(sbe),
+                        consecutive_errors=consecutive_connection_errors
+                    )
+                    
+                    # Log to Cosmos DB
+                    log_container_health_issue("servicebus_error", str(sbe))
+                    
+                    # If we've had too many connection errors, restart
+                    if consecutive_connection_errors > MAX_CONNECTION_ERRORS:
+                        logger.error(f"Too many consecutive Service Bus errors ({consecutive_connection_errors}), restarting")
+                        restart_processing()
+                    
+                    # Sleep longer for connection errors to allow recovery
+                    time.sleep(CONNECTION_ERROR_SLEEP)
+                    
+                except Exception as batch_error:
+                    error_count += 1
+                    logger.error_with_context(
+                        "Error receiving messages batch",
+                        exc_info=True,
+                        error=str(batch_error)
+                    )
+                    
+                    # Log to Cosmos DB
+                    log_container_health_issue("batch_error", str(batch_error))
+                    
+                    # If we've had too many errors, restart
+                    if error_count > 20:
+                        logger.error("Too many errors processing message batches, restarting")
+                        restart_processing()
+                    
+                    # Brief pause to avoid tight loop in case of persistent errors
+                    time.sleep(5)
+                
+        except KeyboardInterrupt:
+            logger.log_with_context("Stopping message processing due to keyboard interrupt")
+        except Exception as e:
+            logger.error_with_context(
+                "Error in message processing loop",
+                exc_info=True,
+                error=str(e)
+            )
+            # Log to Cosmos DB and attempt to restart
+            log_container_health_issue("fatal_error", str(e))
+            restart_processing()
+        finally:
+            # Flush any remaining conversations
+            if len(pending_conversations) > 0:
+                maybe_flush_conversation_batch(force=True)
+                
+            logger.log_with_context("Closing connections")
+            
+            # Log shutdown event to Cosmos DB
+            log_container_health_issue("container_shutdown", "Container shutting down")
+
+if __name__ == "__main__":
+    logger.log_with_context("NL2SQL Queue Processor starting up")
+    main()
