@@ -91,8 +91,11 @@ az container create \
     --azure-file-volume-account-key "$STORAGE_KEY" \
     --azure-file-volume-share-name $STORAGE_SHARE_NAME \
     --azure-file-volume-mount-path "/app/logs" \
-    --dns-name-label $CONTAINER_NAME-dns \
-    --command-line "/app/healthcheck.sh"
+    --dns-name-label $CONTAINER_NAME-dns 
+    # --liveness-probe-command "/app/healthcheck.sh" \
+    # --liveness-probe-interval 30 \
+    # --liveness-probe-failure-threshold 3 \
+    # --liveness-probe-initial-delay 30
 
 echo "Container deployment completed!"
 echo "Container logs: az container logs --resource-group $RESOURCE_GROUP --name $CONTAINER_NAME"

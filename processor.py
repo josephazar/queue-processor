@@ -5,11 +5,27 @@ import asyncio
 import traceback
 import sys
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from azure.servicebus import ServiceBusClient, ServiceBusMessage, ServiceBusReceiveMode
 from azure.servicebus.exceptions import ServiceBusConnectionError, ServiceBusError
 import importlib.util
 from pathlib import Path
+from openai import AzureOpenAI
+import openai
+
+# Import custom modules
+def check_log_directory_size(log_dir, max_size_gb=5):
+    """Check if log directory exceeds maximum size"""
+    total_size = sum(os.path.getsize(os.path.join(log_dir, f)) 
+                    for f in os.listdir(log_dir) if os.path.isfile(os.path.join(log_dir, f)))
+    if total_size > max_size_gb * 1024 * 1024 * 1024:
+        # Alert via your monitoring system
+        log_container_health_issue("log_directory_full", 
+                                  f"Log directory exceeds {max_size_gb}GB")
+        
+# handler = RotatingFileHandler(log_file, maxBytes=max_size_mb*1024*1024, 
+#                              backupCount=backup_count, delay=True)
+
 
 # Add src directory to the path for importing
 base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -44,7 +60,7 @@ from database import (
 )
 
 # Import logging utils
-from logging_utils import setup_logging
+from logging_utils import setup_logging,verify_logging_paths,init_logging
 
 # Check if src/main.py exists and import initialize_assistant
 main_path = os.path.join(src_dir, "main.py")
@@ -57,7 +73,7 @@ else:
     raise ImportError("Could not find src/main.py which contains initialize_assistant")
 
 # Set up logging with environment-aware configuration
-logger = setup_logging(LOGS_DIR, "nl2sql_processor")
+logger = logger = init_logging()
 logger.info("NL2SQL Queue Processor starting up")
 
 # Validate configuration
@@ -197,10 +213,10 @@ def monitor_thread_health(executor):
             # Log to Cosmos DB
             log_container_health_issue("stuck_threads", json.dumps(stuck_requests))
 
+
 async def delete_assistant(assistant_id):
     """
-    Delete an assistant by ID
-    This implementation mirrors the one in nl2sqlroute.py
+    Delete an assistant by ID, handling the case where the assistant doesn't exist
     """
     try:
         if not assistant_id:
@@ -217,8 +233,29 @@ async def delete_assistant(assistant_id):
         # Make the DELETE request
         response = requests.delete(url, headers={"api-key": os.getenv("AZURE_OPENAI_API_KEY")})
 
-        # Handle the response
-        if response.status_code in [200, 201, 202, 204]:
+        # Handle 404 - assistant already doesn't exist
+        if response.status_code == 404:
+            logger.log_with_context(
+                "Assistant already deleted or doesn't exist", 
+                assistant_id=assistant_id
+            )
+            
+            # Remove from cache if present
+            with assistant_cache_lock:
+                for user_email, info in list(assistant_cache.items()):
+                    if info.get("assistant_id") == assistant_id:
+                        del assistant_cache[user_email]
+                        break
+            
+            return {
+                "status": "success", 
+                "message": f"Assistant {assistant_id} already deleted or doesn't exist",
+                "assistant_id": None,
+                "thread_id": None
+            }
+        
+        # Handle success cases
+        elif response.status_code in [200, 201, 202, 204]:
             logger.log_with_context(
                 f"Assistant deleted successfully", 
                 assistant_id=assistant_id
@@ -262,15 +299,42 @@ async def delete_assistant(assistant_id):
             "assistant_id": assistant_id,
             "thread_id": None
         }
-
+    
 def get_cached_assistant(user_email):
-    """Get assistant from cache if it exists"""
+    """Get assistant from cache if it exists with additional validation"""
     with assistant_cache_lock:
         if user_email in assistant_cache:
             info = assistant_cache[user_email]
-            # Update last used time
-            assistant_cache[user_email]["last_used"] = time.time()
-            return info.get("assistant_id"), info.get("thread_id")
+            assistant_id = info.get("assistant_id")
+            thread_id = info.get("thread_id")
+            
+            # Verify the assistant exists before returning it
+            try:
+                # Quick verification call - just check if the assistant exists
+                client = AzureOpenAI(
+                    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+                    azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"),
+                )
+                client.beta.assistants.retrieve(assistant_id)
+                
+                # Assistant exists, update last used time
+                assistant_cache[user_email]["last_used"] = time.time()
+                return assistant_id, thread_id
+                
+            except Exception as e:
+                # Assistant doesn't exist or other error
+                logger.warning_with_context(
+                    "Cached assistant no longer exists or is invalid, removing from cache", 
+                    assistant_id=assistant_id,
+                    user_email=user_email,
+                    error=str(e)
+                )
+                
+                # Remove invalid assistant from cache
+                del assistant_cache[user_email]
+                return None, None
+    
     return None, None
 
 def cache_assistant(user_email, assistant_id, thread_id=None):
@@ -374,28 +438,52 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
                     thread_id = cached_thread_id
         
         # Initialize assistant - either new or existing
-        if assistant_id:
+        try:
+            if assistant_id:
+                logger.log_with_context(
+                    "Using existing assistant", 
+                    request_id=request_id,
+                    assistant_id=assistant_id
+                )
+                sql_assistant = initialize_assistant(DATABASE_TYPE, assistant_id=assistant_id)
+            else:
+                logger.log_with_context(
+                    "Creating new assistant", 
+                    request_id=request_id,
+                    user_email=user_email
+                )
+                sql_assistant = initialize_assistant(DATABASE_TYPE)
+                assistant_id = sql_assistant.assistant.assistant_id
+                assistant_created = True  # Mark that we created a new assistant
+                logger.log_with_context(
+                    "Created new assistant", 
+                    request_id=request_id,
+                    assistant_id=assistant_id
+                )
+        except openai.NotFoundError:
+            # The assistant ID doesn't exist anymore
             logger.log_with_context(
-                "Using existing assistant", 
+                "Assistant not found, creating new one", 
                 request_id=request_id,
-                assistant_id=assistant_id
-            )
-            sql_assistant = initialize_assistant(DATABASE_TYPE, assistant_id=assistant_id)
-        else:
-            logger.log_with_context(
-                "Creating new assistant", 
-                request_id=request_id,
-                user_email=user_email
-            )
-            sql_assistant = initialize_assistant(DATABASE_TYPE)
-            assistant_id = sql_assistant.assistant.assistant_id
-            assistant_created = True  # Mark that we created a new assistant
-            logger.log_with_context(
-                "Created new assistant", 
-                request_id=request_id,
-                assistant_id=assistant_id
+                old_assistant_id=assistant_id
             )
             
+            # Clean up the cache for this user if needed
+            if user_email:
+                with assistant_cache_lock:
+                    if user_email in assistant_cache and assistant_cache[user_email].get("assistant_id") == assistant_id:
+                        del assistant_cache[user_email]
+            
+            # Create a new assistant
+            sql_assistant = initialize_assistant(DATABASE_TYPE)
+            assistant_id = sql_assistant.assistant.assistant_id
+            assistant_created = True
+            logger.log_with_context(
+                "Created new assistant after not found error", 
+                request_id=request_id,
+                assistant_id=assistant_id
+            )
+
         # Create a thread if needed
         if not thread_id:
             thread = sql_assistant.assistant.create_thread()
@@ -540,9 +628,11 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             "thread_id": thread_id
         }
     
-async def process_message(message, receiver):
+
+def process_message(message, action_queue):
     """
     Process a single message from the queue with improved thread safety
+    Returns action to take (complete or abandon)
     """
     request_id = None
     processing_started = False
@@ -565,7 +655,7 @@ async def process_message(message, receiver):
         thread_id = body.get("thread_id")
         user_email = body.get("user_email")
         request_type = body.get("request_type", "nl2sql_chat")
-        report_name = body.get("report_name")  # Add report_name extraction
+        report_name = body.get("report_name")
         
         if not request_id or not question:
             logger.error_with_context(
@@ -573,8 +663,7 @@ async def process_message(message, receiver):
                 request_id=request_id,
                 fields=body.keys()
             )
-            receiver.complete_message(message)
-            return
+            return "complete"  # Skip invalid messages
         
         # Thread safety: Check if this request is already being processed
         with active_requests_lock:
@@ -584,8 +673,7 @@ async def process_message(message, receiver):
                     request_id=request_id,
                     user_email=user_email
                 )
-                receiver.complete_message(message)
-                return
+                return "complete"
             
             # Mark this request as being processed
             active_requests[request_id] = time.time()
@@ -599,13 +687,12 @@ async def process_message(message, receiver):
                 request_id=request_id,
                 status=current_status.get("status")
             )
-            receiver.complete_message(message)
             
             # Remove from active requests
             with active_requests_lock:
                 if request_id in active_requests:
                     del active_requests[request_id]
-            return
+            return "complete"
         
         logger.log_with_context(
             "Processing request", 
@@ -618,7 +705,7 @@ async def process_message(message, receiver):
         update_request_status(request_id, "processing")
         
         # Process the question
-        result = await process_question(
+        result = run_async_in_thread(process_question,
             request_id=request_id,
             question=question,
             assistant_id=assistant_id,
@@ -632,9 +719,6 @@ async def process_message(message, receiver):
         status = "completed" if result.get("status") == "success" else "error"
         update_request_status(request_id, status, result)
         
-        # Complete the message to remove it from the queue
-        receiver.complete_message(message)
-        
         # Calculate total processing time
         total_duration = time.time() - start_time
         logger.log_with_context(
@@ -644,6 +728,8 @@ async def process_message(message, receiver):
             duration=total_duration,
             status=status
         )
+        
+        return "complete"
         
     except Exception as e:
         logger.error_with_context(
@@ -663,8 +749,7 @@ async def process_message(message, receiver):
             }
             update_request_status(request_id, "error", error_result)
         
-        # Return to queue for retry if not already being processed
-        receiver.abandon_message(message)
+        return "abandon"  # Return to queue for retry
     
     finally:
         # Always clean up the active requests tracker
@@ -676,22 +761,23 @@ async def process_message(message, receiver):
         # Force flush any pending conversations regardless of count
         maybe_flush_conversation_batch(force=True)
 
-def run_async_in_thread(async_func, *args):
+def run_async_in_thread(async_func, *args, **kwargs):
     """
     Run an async function in a separate thread using a new event loop
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(async_func(*args))
+        return loop.run_until_complete(async_func(*args, **kwargs))
     finally:
         loop.close()
 
-def process_message_in_thread(message, action_queue):
+def process_message_in_thread(message, _):
     """
     Wrapper to process message in a thread
+    Returns the action to take (complete or abandon)
     """
-    return run_async_in_thread(process_message, message, action_queue)
+    return run_async_in_thread(process_message, message, None)
 
 async def check_assistant_inactivity(assistant_id):
     """
@@ -757,6 +843,17 @@ def cleanup_task():
                 "Cleaned up old conversations",
                 count=deleted_conversations
             )
+            
+            # Clean up old log files (keep for 60 days by default)
+            from logging_utils import cleanup_old_logs
+            deleted_logs = cleanup_old_logs(LOGS_DIR, max_days=15)
+            logger.log_with_context(
+                "Cleaned up old log files",
+                count=deleted_logs
+            )
+            
+            # Check log directory size
+            check_log_directory_size(LOGS_DIR, max_size_gb=2)
             
             # Update last cleanup time
             last_cleanup_time = current_time
@@ -827,6 +924,7 @@ def cleanup_task():
                 error=str(e)
             )
 
+
 def main():
     """
     Main function to process messages from the queue with enhanced health monitoring
@@ -836,6 +934,11 @@ def main():
     if not AZURE_SERVICE_BUS_CONNECTION_STRING:
         logger.error("Azure Service Bus connection string is not set!")
         return
+    
+    # Verify logging paths are set correctly
+    result = verify_logging_paths()
+    if not result:
+        logger.error("Failed to verify logging paths! Logs may not be written correctly.")
     
     logger.log_with_context(
         "Starting message processing",
@@ -903,9 +1006,6 @@ def main():
                             receive_mode=ServiceBusReceiveMode.PEEK_LOCK,
                             prefetch_count=MAX_MESSAGE_COUNT
                         ) as receiver:
-                            # New shared queue for message completion actions
-                            message_actions = []
-                            
                             # Receive batch of messages
                             messages = receiver.receive_messages(
                                 max_message_count=MAX_MESSAGE_COUNT,
@@ -927,25 +1027,31 @@ def main():
                                 
                                 # Submit each message to the thread pool and collect futures
                                 futures = []
+                                message_actions = {}  # Map of messages to actions
+                                
                                 for message in messages:
-                                    futures.append(executor.submit(process_message_in_thread, message, message_actions))
+                                    future = executor.submit(process_message, message, None)
+                                    futures.append((future, message))
                                 
                                 # Wait for all futures to complete
-                                concurrent.futures.wait(futures)
+                                completed, _ = wait([f[0] for f in futures])
                                 
                                 # Process message actions in the main thread where the receiver is valid
-                                with message_actions_lock:
-                                    for message, action in message_actions:
+                                for future, message in futures:
+                                    if future.done():
                                         try:
-                                            if action == 'complete':
+                                            action = future.result()
+                                            if action == "complete":
                                                 receiver.complete_message(message)
-                                            elif action == 'abandon':
+                                            elif action == "abandon":
                                                 receiver.abandon_message(message)
                                         except Exception as e:
-                                            logger.error(f"Error performing message action {action}: {str(e)}")
-                                    
-                                    # Clear the action queue
-                                    message_actions.clear()
+                                            logger.error(f"Error performing message action: {str(e)}")
+                                            # Default to abandoning the message if we can't process the action
+                                            try:
+                                                receiver.abandon_message(message)
+                                            except Exception:
+                                                pass
                             else:
                                 # No messages, sleep briefly before polling again
                                 time.sleep(1)

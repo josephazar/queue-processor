@@ -31,8 +31,13 @@ RUN chmod +x healthcheck.sh
 # Create logs directory
 RUN mkdir -p logs
 
+RUN ls -la /app
+RUN ls -la /app/logs
+RUN touch /app/logs/test.log
+RUN echo "Test" > /app/logs/test.log
+
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
 # Run the processor
-CMD ["python", "processor.py"]
+ENTRYPOINT ["python", "processor.py"]
