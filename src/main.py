@@ -1,5 +1,9 @@
 import os
 from openai import AzureOpenAI
+import sys
+
+# Add the current directory to the path so lib can be found
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib.assistant import AIAssistant
 import argparse
 from lib.tools_fabric import (

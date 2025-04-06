@@ -33,6 +33,10 @@ MAX_WAIT_TIME = int(os.getenv("MAX_WAIT_TIME", "5"))
 CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "7"))
 CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", "1"))
 
+# Assistant settings
+ASSISTANT_POOL_SIZE = int(os.getenv("ASSISTANT_POOL_SIZE", "5"))
+THREAD_LIFETIME_HOURS = int(os.getenv("THREAD_LIFETIME_HOURS", "24"))
+
 # Database type for the assistant
 DATABASE_TYPE = os.getenv("DATABASE_TYPE", "fabric")
 
