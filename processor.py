@@ -13,26 +13,7 @@ from pathlib import Path
 from openai import AzureOpenAI
 import openai
 
-# Import custom modules
-def check_log_directory_size(log_dir, max_size_gb=5):
-    """Check if log directory exceeds maximum size"""
-    total_size = sum(os.path.getsize(os.path.join(log_dir, f)) 
-                    for f in os.listdir(log_dir) if os.path.isfile(os.path.join(log_dir, f)))
-    if total_size > max_size_gb * 1024 * 1024 * 1024:
-        # Alert via your monitoring system
-        log_container_health_issue("log_directory_full", 
-                                  f"Log directory exceeds {max_size_gb}GB")
-        
-# handler = RotatingFileHandler(log_file, maxBytes=max_size_mb*1024*1024, 
-#                              backupCount=backup_count, delay=True)
-
-
-# Add src directory to the path for importing
-base_dir = os.path.dirname(os.path.abspath(__file__))
-src_dir = os.path.join(base_dir, "src")
-sys.path.insert(0, src_dir)
-
-# Import our custom modules
+# Import configuration
 from config import (
     AZURE_SERVICE_BUS_CONNECTION_STRING,
     AZURE_SERVICE_BUS_QUEUE_NAME,
@@ -46,7 +27,7 @@ from config import (
     validate_config
 )
 
-# Import database functions with retry capabilities
+# Import database functions
 from database import (
     store_request, 
     update_request_status, 
@@ -56,14 +37,18 @@ from database import (
     get_assistant_last_activity,
     cleanup_old_conversations,
     bulk_store_conversations,
-    log_container_health_issue
+    log_container_health_issue,
+    # New functions for assistant pool persistence
+    get_pool_assistants,
+    store_pool_assistant,
+    remove_pool_assistant
 )
 
 # Import logging utils
-from logging_utils import setup_logging,verify_logging_paths,init_logging
+from logging_utils import setup_logging, verify_logging_paths, init_logging
 
 # Check if src/main.py exists and import initialize_assistant
-main_path = os.path.join(src_dir, "main.py")
+main_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src", "main.py")
 if os.path.exists(main_path):
     spec = importlib.util.spec_from_file_location("main", main_path)
     main_module = importlib.util.module_from_spec(spec)
@@ -72,23 +57,28 @@ if os.path.exists(main_path):
 else:
     raise ImportError("Could not find src/main.py which contains initialize_assistant")
 
-# Set up logging with environment-aware configuration
-logger = logger = init_logging()
+# Set up logging
+logger = init_logging()
 logger.info("NL2SQL Queue Processor starting up")
 
 # Validate configuration
 validate_config()
 
-# Last cleanup time tracking
-last_cleanup_time = 0
+# Assistant Pool Configuration
+ASSISTANT_POOL_SIZE = int(os.getenv("ASSISTANT_POOL_SIZE", "5"))
+THREAD_LIFETIME_HOURS = int(os.getenv("THREAD_LIFETIME_HOURS", "24"))
+THREAD_LIFETIME_SECONDS = THREAD_LIFETIME_HOURS * 3600
 
 # Thread safety mechanisms
 active_requests = {}
 active_requests_lock = threading.RLock()
 
-# Cache for assistants to avoid recreating them
-assistant_cache = {}
-assistant_cache_lock = threading.RLock()
+# Assistant pool and thread management
+assistant_pool = []
+assistant_pool_lock = threading.RLock()
+assistant_assignments = {}  # Maps assistant_id -> {user_email, thread_id, last_used}
+thread_cache = {}  # Maps user_email -> {assistant_id, thread_id, created_at}
+thread_cache_lock = threading.RLock()
 
 # Message batch tracking for bulk operations
 pending_conversations = []
@@ -97,15 +87,230 @@ pending_conversations_lock = threading.RLock()
 # Health monitoring variables
 last_health_check = 0
 last_message_received = 0
+last_cleanup_time = 0
 consecutive_connection_errors = 0
 
 # Constants
-ASSISTANT_INACTIVITY_TIMEOUT = 60 * 60  # 60 minutes in seconds
 BULK_INSERT_THRESHOLD = 10  # Number of conversations to batch before inserting
 HEALTH_CHECK_INTERVAL = 2700  # 45 minutes
 NO_MESSAGES_TIMEOUT = 1800  # 30 minutes (no messages received)
 MAX_CONNECTION_ERRORS = 10  # Max consecutive connection errors before restart
 CONNECTION_ERROR_SLEEP = 10  # Seconds to sleep after a connection error
+
+def initialize_assistant_pool():
+    """
+    Initialize a pool of assistants, retrieving existing ones from Cosmos DB or creating new ones
+    """
+    global assistant_pool
+    
+    logger.info(f"Initializing assistant pool with target size of {ASSISTANT_POOL_SIZE} assistants")
+    
+    # First, check if we have existing assistants in Cosmos DB
+    existing_assistants = get_pool_assistants()
+    
+    if existing_assistants:
+        logger.info(f"Found {len(existing_assistants)} existing assistants in Cosmos DB")
+        
+        # Verify each assistant exists in OpenAI
+        valid_assistants = []
+        for assistant_id in existing_assistants:
+            try:
+                # Try to retrieve the assistant to verify it exists
+                client = AzureOpenAI(
+                    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+                    azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"),
+                )
+                client.beta.assistants.retrieve(assistant_id)
+                
+                # If successful, add to our valid assistants
+                valid_assistants.append(assistant_id)
+                logger.info(f"Verified existing assistant: {assistant_id}")
+                
+            except Exception as e:
+                logger.warning(f"Assistant {assistant_id} from DB no longer exists in OpenAI: {e}")
+                # Remove from Cosmos DB since it's no longer valid
+                remove_pool_assistant(assistant_id)
+        
+        # Add valid assistants to our pool
+        with assistant_pool_lock:
+            assistant_pool = valid_assistants
+            for assistant_id in assistant_pool:
+                assistant_assignments[assistant_id] = {
+                    "user_email": None,
+                    "thread_id": None,
+                    "last_used": None,
+                    "in_use": False
+                }
+    
+    # Check if we need to create additional assistants to reach the target size
+    assistants_to_create = max(0, ASSISTANT_POOL_SIZE - len(assistant_pool))
+    
+    if assistants_to_create > 0:
+        logger.info(f"Creating {assistants_to_create} new assistants to reach target pool size")
+        
+        created_count = 0
+        for i in range(assistants_to_create):
+            try:
+                assistant = initialize_assistant(DATABASE_TYPE)
+                assistant_id = assistant.assistant.assistant_id
+                
+                # Store in Cosmos DB for persistence
+                store_pool_assistant(assistant_id)
+                
+                with assistant_pool_lock:
+                    assistant_pool.append(assistant_id)
+                    assistant_assignments[assistant_id] = {
+                        "user_email": None,
+                        "thread_id": None,
+                        "last_used": None,
+                        "in_use": False
+                    }
+                    
+                created_count += 1
+                logger.info(f"Created and stored new assistant {i+1}/{assistants_to_create} with ID: {assistant_id}")
+                
+            except Exception as e:
+                logger.error(f"Failed to create assistant {i+1}/{assistants_to_create}: {str(e)}", exc_info=True)
+    
+    # Log final pool status
+    with assistant_pool_lock:
+        logger.info(f"Assistant pool initialized with {len(assistant_pool)}/{ASSISTANT_POOL_SIZE} assistants")
+    
+    return len(assistant_pool) > 0
+
+def get_available_assistant(user_email):
+    """
+    Get an available assistant from the pool or the user's existing assignment
+    
+    Args:
+        user_email: The user's email to find an existing assistant or assign a new one
+        
+    Returns:
+        tuple: (assistant_id, thread_id, is_new_thread)
+    """
+    # First check if the user already has a thread in the cache
+    with thread_cache_lock:
+        if user_email in thread_cache:
+            thread_info = thread_cache[user_email]
+            assistant_id = thread_info["assistant_id"]
+            thread_id = thread_info["thread_id"]
+            created_at = thread_info["created_at"]
+            
+            # Check if thread has expired
+            if time.time() - created_at > THREAD_LIFETIME_SECONDS:
+                logger.info(f"Thread for user {user_email} has expired, will assign new thread")
+                # Remove from thread cache
+                del thread_cache[user_email]
+                # But keep assistant_id for reassignment
+            else:
+                # Thread still valid
+                with assistant_pool_lock:
+                    # Update last_used time
+                    if assistant_id in assistant_assignments:
+                        assistant_assignments[assistant_id]["last_used"] = time.time()
+                
+                logger.info(f"Reusing existing thread for user {user_email} with assistant {assistant_id}")
+                return assistant_id, thread_id, False
+    
+    # Need to assign an assistant and create a new thread
+    with assistant_pool_lock:
+        # First try to find an unassigned assistant
+        for assistant_id in assistant_pool:
+            if not assistant_assignments[assistant_id]["in_use"]:
+                # Assign this assistant to the user
+                assistant_assignments[assistant_id] = {
+                    "user_email": user_email,
+                    "thread_id": None,  # Will be set after thread creation
+                    "last_used": time.time(),
+                    "in_use": True
+                }
+                logger.info(f"Assigned available assistant {assistant_id} to user {user_email}")
+                return assistant_id, None, True
+        
+        # If all assistants are in use, find the least recently used
+        least_recent_time = float('inf')
+        least_recent_assistant = None
+        
+        for assistant_id in assistant_pool:
+            last_used = assistant_assignments[assistant_id]["last_used"]
+            if last_used is not None and last_used < least_recent_time:
+                least_recent_time = last_used
+                least_recent_assistant = assistant_id
+        
+        if least_recent_assistant:
+            # Re-assign this assistant to the new user
+            assistant_assignments[least_recent_assistant] = {
+                "user_email": user_email,
+                "thread_id": None,  # Will be set after thread creation
+                "last_used": time.time(),
+                "in_use": True
+            }
+            logger.info(f"Reassigned least recently used assistant {least_recent_assistant} to user {user_email}")
+            return least_recent_assistant, None, True
+    
+    # If we get here, something went wrong - no assistants available
+    logger.error("No assistants available in pool. This should never happen!")
+    
+    # Emergency fallback: create a new assistant outside the pool
+    try:
+        logger.warning("Creating emergency assistant outside pool")
+        assistant = initialize_assistant(DATABASE_TYPE)
+        return assistant.assistant.assistant_id, None, True
+    except Exception as e:
+        logger.error(f"Failed to create emergency assistant: {str(e)}", exc_info=True)
+        raise RuntimeError("Failed to get an assistant for the user")
+
+def update_thread_assignment(assistant_id, thread_id, user_email):
+    """
+    Update the assistant and thread assignments after thread creation
+    
+    Args:
+        assistant_id: The assistant ID
+        thread_id: The newly created thread ID
+        user_email: The user's email
+    """
+    # Update assistant assignment
+    with assistant_pool_lock:
+        if assistant_id in assistant_assignments:
+            assistant_assignments[assistant_id]["thread_id"] = thread_id
+            assistant_assignments[assistant_id]["last_used"] = time.time()
+    
+    # Update thread cache
+    with thread_cache_lock:
+        thread_cache[user_email] = {
+            "assistant_id": assistant_id,
+            "thread_id": thread_id,
+            "created_at": time.time()
+        }
+    
+    logger.info(f"Updated thread assignment: assistant={assistant_id}, thread={thread_id}, user={user_email}")
+
+def release_assistant(assistant_id):
+    """
+    Mark an assistant as no longer in use
+    
+    Args:
+        assistant_id: The assistant ID to release
+    """
+    with assistant_pool_lock:
+        if assistant_id in assistant_assignments:
+            user_email = assistant_assignments[assistant_id]["user_email"]
+            assistant_assignments[assistant_id] = {
+                "user_email": None,
+                "thread_id": None,
+                "last_used": time.time(),
+                "in_use": False
+            }
+            logger.info(f"Released assistant {assistant_id} from user {user_email}")
+            
+            # Also remove from thread cache
+            with thread_cache_lock:
+                for email, info in list(thread_cache.items()):
+                    if info["assistant_id"] == assistant_id:
+                        del thread_cache[email]
+                        logger.info(f"Removed thread cache entry for user {email}")
+                        break
 
 def check_container_health():
     """
@@ -165,6 +370,15 @@ def check_container_health():
                 log_container_health_issue("stuck_threads", json.dumps(stuck_requests))
                 # Don't fail health check for this, but log it
         
+        # Check assistant pool health
+        with assistant_pool_lock:
+            if len(assistant_pool) < ASSISTANT_POOL_SIZE * 0.5:
+                logger.warning(f"Assistant pool size is critically low: {len(assistant_pool)}/{ASSISTANT_POOL_SIZE}")
+                log_container_health_issue("assistant_pool_depleted", 
+                                          f"Only {len(assistant_pool)}/{ASSISTANT_POOL_SIZE} assistants in pool")
+                # Try to replenish the pool
+                replenish_assistant_pool()
+        
         # All checks passed
         consecutive_connection_errors = 0
         logger.info("All container health checks passed")
@@ -175,6 +389,42 @@ def check_container_health():
         log_container_health_issue("health_check_error", str(e))
         consecutive_connection_errors += 1
         return False
+
+def replenish_assistant_pool():
+    """
+    Check and replenish the assistant pool if needed
+    """
+    with assistant_pool_lock:
+        current_pool_size = len(assistant_pool)
+        assistants_to_add = max(0, ASSISTANT_POOL_SIZE - current_pool_size)
+        
+        if assistants_to_add > 0:
+            logger.info(f"Replenishing assistant pool, adding {assistants_to_add} assistants")
+            
+            added_count = 0
+            for i in range(assistants_to_add):
+                try:
+                    assistant = initialize_assistant(DATABASE_TYPE)
+                    assistant_id = assistant.assistant.assistant_id
+                    
+                    # Store in Cosmos DB for persistence
+                    store_pool_assistant(assistant_id)
+                    
+                    assistant_pool.append(assistant_id)
+                    assistant_assignments[assistant_id] = {
+                        "user_email": None,
+                        "thread_id": None,
+                        "last_used": None,
+                        "in_use": False
+                    }
+                    
+                    added_count += 1
+                    logger.info(f"Added new assistant to pool: {assistant_id}")
+                    
+                except Exception as e:
+                    logger.error(f"Failed to add assistant to pool: {str(e)}", exc_info=True)
+            
+            logger.info(f"Added {added_count}/{assistants_to_add} assistants to pool. New size: {current_pool_size + added_count}")
 
 def restart_processing():
     """
@@ -213,7 +463,6 @@ def monitor_thread_health(executor):
             # Log to Cosmos DB
             log_container_health_issue("stuck_threads", json.dumps(stuck_requests))
 
-
 async def delete_assistant(assistant_id):
     """
     Delete an assistant by ID, handling the case where the assistant doesn't exist
@@ -222,6 +471,19 @@ async def delete_assistant(assistant_id):
         if not assistant_id:
             return {"status": "error", "message": "No assistant ID provided"}
         
+        # Check if this assistant is in our pool - if so, don't delete it
+        with assistant_pool_lock:
+            if assistant_id in assistant_pool:
+                logger.info(f"Not deleting assistant {assistant_id} because it's in the pool - just releasing it")
+                release_assistant(assistant_id)
+                return {
+                    "status": "success", 
+                    "message": f"Assistant {assistant_id} released (not deleted because it's in the pool)",
+                    "assistant_id": None,
+                    "thread_id": None
+                }
+        
+        # The assistant is not in our pool, so it's safe to delete
         # Construct the API URL from environment variables
         endpoint = os.getenv("AZURE_OPENAI_API_ENDPOINT")
         api_version = os.getenv("AZURE_OPENAI_API_VERSION")
@@ -235,17 +497,7 @@ async def delete_assistant(assistant_id):
 
         # Handle 404 - assistant already doesn't exist
         if response.status_code == 404:
-            logger.log_with_context(
-                "Assistant already deleted or doesn't exist", 
-                assistant_id=assistant_id
-            )
-            
-            # Remove from cache if present
-            with assistant_cache_lock:
-                for user_email, info in list(assistant_cache.items()):
-                    if info.get("assistant_id") == assistant_id:
-                        del assistant_cache[user_email]
-                        break
+            logger.info(f"Assistant already deleted or doesn't exist: {assistant_id}")
             
             return {
                 "status": "success", 
@@ -256,17 +508,7 @@ async def delete_assistant(assistant_id):
         
         # Handle success cases
         elif response.status_code in [200, 201, 202, 204]:
-            logger.log_with_context(
-                f"Assistant deleted successfully", 
-                assistant_id=assistant_id
-            )
-            
-            # Remove from cache if present
-            with assistant_cache_lock:
-                for user_email, info in list(assistant_cache.items()):
-                    if info.get("assistant_id") == assistant_id:
-                        del assistant_cache[user_email]
-                        break
+            logger.info(f"Assistant deleted successfully: {assistant_id}")
             
             return {
                 "status": "success", 
@@ -276,10 +518,7 @@ async def delete_assistant(assistant_id):
             }
         else:
             error_msg = f"Error deleting assistant: {response.text}"
-            logger.error_with_context(
-                error_msg,
-                assistant_id=assistant_id
-            )
+            logger.error(f"{error_msg}, assistant_id={assistant_id}")
             return {
                 "status": "error",
                 "message": error_msg,
@@ -287,66 +526,15 @@ async def delete_assistant(assistant_id):
                 "thread_id": None
             }
     except Exception as e:
-        logger.error_with_context(
-            f"Error deleting assistant", 
-            assistant_id=assistant_id,
-            exc_info=True,
-            error=str(e)
-        )
+        logger.error(f"Error deleting assistant: {str(e)}", exc_info=True)
         return {
             "status": "error", 
             "message": f"Error deleting assistant: {str(e)}",
             "assistant_id": assistant_id,
             "thread_id": None
         }
-    
-def get_cached_assistant(user_email):
-    """Get assistant from cache if it exists with additional validation"""
-    with assistant_cache_lock:
-        if user_email in assistant_cache:
-            info = assistant_cache[user_email]
-            assistant_id = info.get("assistant_id")
-            thread_id = info.get("thread_id")
-            
-            # Verify the assistant exists before returning it
-            try:
-                # Quick verification call - just check if the assistant exists
-                client = AzureOpenAI(
-                    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-                    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-                    azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"),
-                )
-                client.beta.assistants.retrieve(assistant_id)
-                
-                # Assistant exists, update last used time
-                assistant_cache[user_email]["last_used"] = time.time()
-                return assistant_id, thread_id
-                
-            except Exception as e:
-                # Assistant doesn't exist or other error
-                logger.warning_with_context(
-                    "Cached assistant no longer exists or is invalid, removing from cache", 
-                    assistant_id=assistant_id,
-                    user_email=user_email,
-                    error=str(e)
-                )
-                
-                # Remove invalid assistant from cache
-                del assistant_cache[user_email]
-                return None, None
-    
-    return None, None
 
-def cache_assistant(user_email, assistant_id, thread_id=None):
-    """Store assistant in cache"""
-    with assistant_cache_lock:
-        assistant_cache[user_email] = {
-            "assistant_id": assistant_id,
-            "thread_id": thread_id,
-            "last_used": time.time()
-        }
-
-def maybe_flush_conversation_batch(force=True):
+def maybe_flush_conversation_batch(force=False):
     """Check if we have enough pending conversations to do a bulk insert"""
     global pending_conversations
     conversations_to_insert = []
@@ -358,14 +546,9 @@ def maybe_flush_conversation_batch(force=True):
     if conversations_to_insert:
         try:
             count = bulk_store_conversations(conversations_to_insert)
-            logger.log_with_context(f"Bulk inserted {count} conversations")
+            logger.info(f"Bulk inserted {count} conversations")
         except Exception as e:
-            logger.error_with_context(
-                "Failed to bulk insert conversations", 
-                exc_info=True,
-                count=len(conversations_to_insert),
-                error=str(e)
-            )
+            logger.error(f"Failed to bulk insert conversations: {str(e)}", exc_info=True)
             # Fall back to individual inserts
             for conv in conversations_to_insert:
                 try:
@@ -381,11 +564,7 @@ def maybe_flush_conversation_batch(force=True):
                         conversation_id=conv.get("conversation_id")
                     )
                 except Exception as inner_e:
-                    logger.error_with_context(
-                        "Failed to store individual conversation", 
-                        request_id=conv.get("request_id"),
-                        error=str(inner_e)
-                    )
+                    logger.error(f"Failed to store individual conversation: {str(inner_e)}")
 
 async def process_question(request_id, question, assistant_id=None, thread_id=None, user_email=None, request_type=None, report_name=None):
     """
@@ -393,27 +572,35 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
     This is the core function that communicates with the AI model.
     """
     start_time = time.time()
-    assistant_created = False  # Track if we created a new assistant
+    new_thread_created = False  # Track if we created a new thread
     
     try:
-        logger.log_with_context(
-            f"Processing question", 
-            request_id=request_id,
-            user_email=user_email,
-            assistant_id=assistant_id,
-            thread_id=thread_id
-        )
+        logger.info(f"Processing question for request_id={request_id}, user_email={user_email}")
         
         # Check if this is a termination request
-        if any(word == question.lower() for word in ["bye", "exit", "end"]):
-            logger.log_with_context(
-                "Received termination request", 
-                request_id=request_id, 
-                user_email=user_email
-            )
+        if any(word in question.lower().split() for word in ["bye", "exit", "end"]):
+            logger.info(f"Received termination request from user_email={user_email}")
+            
+            # Don't delete assistants in pool, just release the assignment
             if assistant_id:
-                # If we have an assistant_id, delete it using the delete_assistant function
-                return await delete_assistant(assistant_id)
+                with assistant_pool_lock:
+                    if assistant_id in assistant_pool:
+                        release_assistant(assistant_id)
+                        
+                        # Also clear thread cache for this user
+                        with thread_cache_lock:
+                            if user_email in thread_cache:
+                                del thread_cache[user_email]
+                        
+                        return {
+                            "status": "success", 
+                            "message": "Goodbye! Your conversation has ended.", 
+                            "assistant_id": None, 
+                            "thread_id": None
+                        }
+                    else:
+                        # Not in our pool, safe to delete
+                        return await delete_assistant(assistant_id)
             else:
                 return {
                     "status": "success", 
@@ -422,83 +609,48 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
                     "thread_id": None
                 }
         
-        # Check cache for existing assistant
-        if not assistant_id and user_email:
-            cached_assistant_id, cached_thread_id = get_cached_assistant(user_email)
-            if cached_assistant_id:
-                logger.log_with_context(
-                    "Using cached assistant", 
-                    request_id=request_id,
-                    user_email=user_email,
-                    assistant_id=cached_assistant_id
-                )
-                assistant_id = cached_assistant_id
-                # Only use cached thread if explicitly provided or not processing a new question
-                if thread_id is None and cached_thread_id:
-                    thread_id = cached_thread_id
+        # Get an assistant from the pool or reuse existing assignment
+        if not assistant_id and not thread_id and user_email:
+            assistant_id, thread_id, is_new_thread = get_available_assistant(user_email)
+            new_thread_created = is_new_thread
         
-        # Initialize assistant - either new or existing
+        # Initialize assistant - will be from pool
         try:
-            if assistant_id:
-                logger.log_with_context(
-                    "Using existing assistant", 
-                    request_id=request_id,
-                    assistant_id=assistant_id
-                )
-                sql_assistant = initialize_assistant(DATABASE_TYPE, assistant_id=assistant_id)
-            else:
-                logger.log_with_context(
-                    "Creating new assistant", 
-                    request_id=request_id,
-                    user_email=user_email
-                )
-                sql_assistant = initialize_assistant(DATABASE_TYPE)
-                assistant_id = sql_assistant.assistant.assistant_id
-                assistant_created = True  # Mark that we created a new assistant
-                logger.log_with_context(
-                    "Created new assistant", 
-                    request_id=request_id,
-                    assistant_id=assistant_id
-                )
+            logger.info(f"Using assistant_id={assistant_id}")
+            sql_assistant = initialize_assistant(DATABASE_TYPE, assistant_id=assistant_id)
         except openai.NotFoundError:
-            # The assistant ID doesn't exist anymore
-            logger.log_with_context(
-                "Assistant not found, creating new one", 
-                request_id=request_id,
-                old_assistant_id=assistant_id
-            )
+            # The assistant ID doesn't exist anymore (shouldn't happen with pool)
+            logger.error(f"Assistant not found: {assistant_id}. This shouldn't happen with the pool approach.")
             
-            # Clean up the cache for this user if needed
-            if user_email:
-                with assistant_cache_lock:
-                    if user_email in assistant_cache and assistant_cache[user_email].get("assistant_id") == assistant_id:
-                        del assistant_cache[user_email]
+            # Remove from pool and DB since it no longer exists
+            with assistant_pool_lock:
+                if assistant_id in assistant_pool:
+                    assistant_pool.remove(assistant_id)
+                    del assistant_assignments[assistant_id]
             
-            # Create a new assistant
-            sql_assistant = initialize_assistant(DATABASE_TYPE)
-            assistant_id = sql_assistant.assistant.assistant_id
-            assistant_created = True
-            logger.log_with_context(
-                "Created new assistant after not found error", 
-                request_id=request_id,
-                assistant_id=assistant_id
-            )
+            # Remove from Cosmos DB
+            remove_pool_assistant(assistant_id)
+            
+            # Try to get a different assistant from the pool
+            assistant_id, thread_id, is_new_thread = get_available_assistant(user_email)
+            new_thread_created = is_new_thread
+            
+            # Initialize with the new assistant
+            sql_assistant = initialize_assistant(DATABASE_TYPE, assistant_id=assistant_id)
+            logger.info(f"Created replacement assistant: {assistant_id}")
 
         # Create a thread if needed
         if not thread_id:
             thread = sql_assistant.assistant.create_thread()
             thread_id = thread.id
-            logger.log_with_context(
-                "Created new thread", 
-                request_id=request_id,
-                thread_id=thread_id,
-                assistant_id=assistant_id
-            )
+            new_thread_created = True
+            logger.info(f"Created new thread: {thread_id} for assistant: {assistant_id}")
+            
+            # Update assignments
+            if user_email:
+                update_thread_assignment(assistant_id, thread_id, user_email)
         
-        # Only update cache if everything is successful so far
-        # We'll update the cache at the end if all processing succeeds
-        
-        # Process the question with a timeout
+        # Process the question
         try:
             # Use a timer to implement a timeout since we can't use asyncio.wait_for
             start_processing_time = time.time()
@@ -513,12 +665,7 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             # Check if we timed out during processing
             processing_duration = time.time() - start_processing_time
             if processing_duration > timeout:
-                logger.warning(
-                    f"Request processing took longer than timeout", 
-                    request_id=request_id,
-                    duration=processing_duration,
-                    timeout=timeout
-                )
+                logger.warning(f"Request processing took longer than timeout: {processing_duration}s > {timeout}s")
             
             # Extract answer
             answer = response_dict.get("answer", "No answer was generated")
@@ -545,18 +692,14 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             # Check if we should do a bulk insert
             maybe_flush_conversation_batch()
             
-            # If we've gotten this far, it's safe to update the cache
-            if user_email:
-                cache_assistant(user_email, assistant_id, thread_id)
+            # Update the last_used time for this assistant
+            with assistant_pool_lock:
+                if assistant_id in assistant_assignments:
+                    assistant_assignments[assistant_id]["last_used"] = time.time()
             
             # Calculate total processing time
             total_duration = time.time() - start_time
-            logger.log_with_context(
-                "Completed processing question", 
-                request_id=request_id,
-                user_email=user_email,
-                duration=total_duration
-            )
+            logger.info(f"Completed processing question in {total_duration:.2f}s")
             
             # Return the response with assistant and thread IDs
             return {
@@ -566,68 +709,37 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
                 "thread_id": thread_id
             }
         except Exception as e:
-            logger.error_with_context(
-                "Error calling create_response", 
-                request_id=request_id,
-                assistant_id=assistant_id,
-                thread_id=thread_id,
-                exc_info=True,
-                error=str(e)
-            )
+            logger.error(f"Error calling create_response: {str(e)}", exc_info=True)
             
-            # If we created a new assistant and there was an error, clean it up
-            if assistant_created:
-                try:
-                    logger.log_with_context(
-                        "Cleaning up assistant after error", 
-                        assistant_id=assistant_id
-                    )
-                    await delete_assistant(assistant_id)
-                except Exception as cleanup_error:
-                    logger.error_with_context(
-                        "Failed to clean up assistant after error", 
-                        assistant_id=assistant_id,
-                        error=str(cleanup_error)
-                    )
+            # If we created a new thread but there was an error, we should clean up
+            if new_thread_created:
+                # Don't clean up the assistant (it's in the pool) but make it available again
+                with assistant_pool_lock:
+                    if assistant_id in assistant_assignments:
+                        assistant_assignments[assistant_id]["in_use"] = False
+                        assistant_assignments[assistant_id]["thread_id"] = None
+                
+                # Remove from thread cache if present
+                with thread_cache_lock:
+                    if user_email in thread_cache and thread_cache[user_email]["thread_id"] == thread_id:
+                        del thread_cache[user_email]
             
             return {
                 "status": "error",
                 "message": f"Error processing question: {str(e)}",
-                "assistant_id": None if assistant_created else assistant_id,
-                "thread_id": thread_id
+                "assistant_id": assistant_id,  # Keep the assistant_id since it's from the pool
+                "thread_id": None  # Clear the thread_id since there was an error
             }
     
     except Exception as e:
-        logger.error_with_context(
-            "Error processing question", 
-            request_id=request_id,
-            user_email=user_email,
-            exc_info=True,
-            error=str(e)
-        )
-        
-        # If we created a new assistant and there was an error, clean it up
-        if assistant_created:
-            try:
-                logger.log_with_context(
-                    "Cleaning up assistant after error", 
-                    assistant_id=assistant_id
-                )
-                await delete_assistant(assistant_id)
-            except Exception as cleanup_error:
-                logger.error_with_context(
-                    "Failed to clean up assistant after error", 
-                    assistant_id=assistant_id,
-                    error=str(cleanup_error)
-                )
+        logger.error(f"Error processing question: {str(e)}", exc_info=True)
         
         return {
             "status": "error",
             "message": f"Error processing question: {str(e)}",
-            "assistant_id": None if assistant_created else assistant_id,
-            "thread_id": thread_id
+            "assistant_id": assistant_id,  # Keep the assistant_id if it exists
+            "thread_id": None
         }
-    
 
 def process_message(message, action_queue):
     """
@@ -658,21 +770,13 @@ def process_message(message, action_queue):
         report_name = body.get("report_name")
         
         if not request_id or not question:
-            logger.error_with_context(
-                "Message missing required fields", 
-                request_id=request_id,
-                fields=body.keys()
-            )
+            logger.error(f"Message missing required fields: {body.keys()}")
             return "complete"  # Skip invalid messages
         
         # Thread safety: Check if this request is already being processed
         with active_requests_lock:
             if request_id in active_requests:
-                logger.log_with_context(
-                    "Request already being processed, skipping", 
-                    request_id=request_id,
-                    user_email=user_email
-                )
+                logger.info(f"Request {request_id} already being processed, skipping")
                 return "complete"
             
             # Mark this request as being processed
@@ -682,11 +786,7 @@ def process_message(message, action_queue):
         # Check the current status of the request
         current_status = get_request_status(request_id)
         if current_status and current_status.get("status") in ["completed", "error"]:
-            logger.log_with_context(
-                "Request already processed, skipping", 
-                request_id=request_id,
-                status=current_status.get("status")
-            )
+            logger.info(f"Request {request_id} already processed with status {current_status.get('status')}, skipping")
             
             # Remove from active requests
             with active_requests_lock:
@@ -694,12 +794,7 @@ def process_message(message, action_queue):
                     del active_requests[request_id]
             return "complete"
         
-        logger.log_with_context(
-            "Processing request", 
-            request_id=request_id,
-            user_email=user_email,
-            request_type=request_type
-        )
+        logger.info(f"Processing request {request_id} for user {user_email}")
         
         # Update the request status to processing
         update_request_status(request_id, "processing")
@@ -721,24 +816,12 @@ def process_message(message, action_queue):
         
         # Calculate total processing time
         total_duration = time.time() - start_time
-        logger.log_with_context(
-            "Completed processing request", 
-            request_id=request_id,
-            user_email=user_email,
-            duration=total_duration,
-            status=status
-        )
+        logger.info(f"Completed processing request {request_id} in {total_duration:.2f}s with status {status}")
         
         return "complete"
         
     except Exception as e:
-        logger.error_with_context(
-            "Error processing message", 
-            request_id=request_id,
-            user_email=user_email if 'user_email' in locals() else None,
-            exc_info=True,
-            error=str(e)
-        )
+        logger.error(f"Error processing message: {str(e)}", exc_info=True)
         
         # Update status if we have a request_id
         if request_id:
@@ -779,38 +862,9 @@ def process_message_in_thread(message, _):
     """
     return run_async_in_thread(process_message, message, None)
 
-async def check_assistant_inactivity(assistant_id):
-    """
-    Check if an assistant has been inactive for more than the inactivity timeout
-    
-    Args:
-        assistant_id (str): The assistant ID to check
-        
-    Returns:
-        bool: True if the assistant is inactive and should be deleted, False otherwise
-    """
-    last_activity = get_assistant_last_activity(assistant_id)
-    
-    # If no activity found, use the cache's last_used time as fallback
-    if last_activity is None:
-        with assistant_cache_lock:
-            for user_email, info in assistant_cache.items():
-                if info.get("assistant_id") == assistant_id:
-                    last_activity = info.get("last_used")
-                    break
-    
-    if last_activity is None:
-        # If still no activity info, assume it's inactive
-        return True
-    
-    current_time = time.time()
-    time_since_last_activity = current_time - last_activity
-    
-    return time_since_last_activity > ASSISTANT_INACTIVITY_TIMEOUT
-
 def cleanup_task():
     """
-    Periodically clean up old requests and inactive assistants
+    Periodically clean up old requests and expired threads
     """
     global last_cleanup_time
     
@@ -819,111 +873,71 @@ def cleanup_task():
     
     # Ensure all pending conversations are flushed first
     if len(pending_conversations) > 0:
-        maybe_flush_conversation_batch()
+        maybe_flush_conversation_batch(force=True)
     
     # Convert hours to seconds for comparison
     cleanup_interval_seconds = CLEANUP_INTERVAL_HOURS * 3600
     
     if time_since_last_cleanup >= cleanup_interval_seconds:
-        logger.log_with_context(
-            f"Running cleanup task",
-            cleanup_days=CLEANUP_DAYS
-        )
+        logger.info(f"Running cleanup task")
         try:
             # Clean up old requests
             deleted_items = cleanup_old_requests(CLEANUP_DAYS)
-            logger.log_with_context(
-                "Cleaned up old requests",
-                count=len(deleted_items)
-            )
+            logger.info(f"Cleaned up {len(deleted_items)} old requests")
             
             # Clean up old conversations (keep for 30 days by default)
             deleted_conversations = cleanup_old_conversations(30)
-            logger.log_with_context(
-                "Cleaned up old conversations",
-                count=deleted_conversations
-            )
+            logger.info(f"Cleaned up {deleted_conversations} old conversations")
             
-            # Clean up old log files (keep for 60 days by default)
+            # Clean up old log files (keep for 15 days)
             from logging_utils import cleanup_old_logs
             deleted_logs = cleanup_old_logs(LOGS_DIR, max_days=15)
-            logger.log_with_context(
-                "Cleaned up old log files",
-                count=deleted_logs
-            )
+            logger.info(f"Cleaned up {deleted_logs} old log files")
             
             # Check log directory size
+            from logging_utils import check_log_directory_size
             check_log_directory_size(LOGS_DIR, max_size_gb=2)
             
             # Update last cleanup time
             last_cleanup_time = current_time
             
-            # Clean up assistant cache entries and inactive assistants
-            with assistant_cache_lock:
-                # First, collect assistants that should be deleted
-                assistants_to_delete = []
-                expired_keys = []
+            # Clean up expired threads from thread cache
+            with thread_cache_lock:
+                expired_count = 0
+                for user_email, info in list(thread_cache.items()):
+                    thread_age = current_time - info["created_at"]
+                    if thread_age > THREAD_LIFETIME_SECONDS:
+                        del thread_cache[user_email]
+                        expired_count += 1
                 
-                for user_email, info in assistant_cache.items():
-                    assistant_id = info.get("assistant_id")
-                    
-                    # Check inactivity
-                    is_inactive = run_async_in_thread(check_assistant_inactivity, assistant_id)
-                    
-                    if is_inactive:
-                        logger.log_with_context(
-                            "Assistant inactive, marking for deletion",
-                            assistant_id=assistant_id,
-                            user_email=user_email
-                        )
-                        assistants_to_delete.append(assistant_id)
-                        expired_keys.append(user_email)
-                
-                # Now delete the assistants from Azure OpenAI
-                for assistant_id in assistants_to_delete:
+                if expired_count > 0:
+                    logger.info(f"Cleaned up {expired_count} expired threads from cache")
+            
+            # Ensure assistant pool is at full capacity
+            replenish_assistant_pool()
+            
+            # Verify each assistant in the pool still exists
+            with assistant_pool_lock:
+                for assistant_id in list(assistant_pool):
                     try:
-                        logger.log_with_context(
-                            "Deleting inactive assistant",
-                            assistant_id=assistant_id
+                        # Try to retrieve the assistant to verify it exists
+                        client = AzureOpenAI(
+                            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                            api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+                            azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"),
                         )
-                        result = run_async_in_thread(delete_assistant, assistant_id)
-                        if result.get("status") == "success":
-                            logger.log_with_context(
-                                "Successfully deleted assistant",
-                                assistant_id=assistant_id
-                            )
-                        else:
-                            logger.warning(
-                                "Failed to delete assistant",
-                                assistant_id=assistant_id,
-                                error=result.get('message')
-                            )
+                        client.beta.assistants.retrieve(assistant_id)
                     except Exception as e:
-                        logger.error_with_context(
-                            "Error deleting assistant",
-                            assistant_id=assistant_id,
-                            exc_info=True,
-                            error=str(e)
-                        )
-                
-                # Finally remove the expired entries from the cache
-                for key in expired_keys:
-                    if key in assistant_cache:
-                        del assistant_cache[key]
-                
-                if expired_keys:
-                    logger.log_with_context(
-                        "Cleaned up expired assistant cache entries",
-                        count=len(expired_keys)
-                    )
-                
+                        logger.warning(f"Assistant {assistant_id} no longer exists: {e}")
+                        # Remove from pool
+                        assistant_pool.remove(assistant_id)
+                        if assistant_id in assistant_assignments:
+                            del assistant_assignments[assistant_id]
+                        # Remove from Cosmos DB
+                        remove_pool_assistant(assistant_id)
+            
         except Exception as e:
-            logger.error_with_context(
-                "Error during cleanup task",
-                exc_info=True,
-                error=str(e)
-            )
-
+            logger.error(f"Error during cleanup task: {str(e)}", exc_info=True)
 
 def main():
     """
@@ -940,12 +954,13 @@ def main():
     if not result:
         logger.error("Failed to verify logging paths! Logs may not be written correctly.")
     
-    logger.log_with_context(
-        "Starting message processing",
-        workers=MAX_WORKERS,
-        queue=AZURE_SERVICE_BUS_QUEUE_NAME,
-        database_type=DATABASE_TYPE
-    )
+    logger.info(f"Starting message processing with {MAX_WORKERS} workers")
+    
+    # Initialize the assistant pool
+    pool_initialized = initialize_assistant_pool()
+    if not pool_initialized:
+        logger.error("Failed to initialize assistant pool, exiting")
+        return
     
     # Initialize time tracking variables
     last_cleanup_time = time.time()
@@ -956,14 +971,14 @@ def main():
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         try:
             # Log startup event to Cosmos DB
-            log_container_health_issue("container_startup", f"Container started with {MAX_WORKERS} workers")
+            log_container_health_issue("container_startup", f"Container started with {MAX_WORKERS} workers, {len(assistant_pool)}/{ASSISTANT_POOL_SIZE} assistants in pool")
             
             # Perform initial health check
             if not check_container_health():
                 logger.warning("Initial health check failed, proceeding anyway...")
             
             # Main processing loop
-            logger.log_with_context("Starting message processing loop")
+            logger.info("Starting message processing loop")
             
             # Monitor metrics for processor health
             message_count = 0
@@ -1019,11 +1034,7 @@ def main():
                                 
                                 batch_size = len(messages)
                                 message_count += batch_size
-                                logger.log_with_context(
-                                    "Received messages batch",
-                                    count=batch_size,
-                                    total_processed=message_count
-                                )
+                                logger.info(f"Received batch of {batch_size} messages")
                                 
                                 # Submit each message to the thread pool and collect futures
                                 futures = []
@@ -1060,15 +1071,22 @@ def main():
                     current_time = time.time()
                     if current_time - start_time > 3600:  # 1 hour
                         uptime = current_time - start_time
-                        logger.log_with_context(
-                            "Processor metrics",
-                            uptime_hours=round(uptime / 3600, 2),
-                            messages_processed=message_count,
-                            errors=error_count,
-                            messages_per_hour=round(message_count / (uptime / 3600), 2),
-                            active_requests=len(active_requests),
-                            cached_assistants=len(assistant_cache),
-                            connection_errors=consecutive_connection_errors
+                        
+                        # Count active assistants
+                        with assistant_pool_lock:
+                            active_assistants = sum(1 for a in assistant_assignments.values() if a["in_use"])
+                        
+                        # Count active threads
+                        with thread_cache_lock:
+                            active_threads = len(thread_cache)
+                        
+                        logger.info(
+                            f"Processor metrics - Uptime: {uptime/3600:.2f}h, "
+                            f"Messages: {message_count}, Errors: {error_count}, "
+                            f"Active requests: {len(active_requests)}, "
+                            f"Pool: {len(assistant_pool)}/{ASSISTANT_POOL_SIZE}, "
+                            f"Active assistants: {active_assistants}, "
+                            f"Active threads: {active_threads}"
                         )
                         
                         # Also log health metrics to Cosmos DB
@@ -1077,7 +1095,10 @@ def main():
                             "messages_processed": message_count,
                             "errors": error_count,
                             "active_requests": len(active_requests),
-                            "cached_assistants": len(assistant_cache),
+                            "assistant_pool_size": len(assistant_pool),
+                            "assistant_pool_capacity": ASSISTANT_POOL_SIZE,
+                            "active_assistants": active_assistants,
+                            "active_threads": active_threads,
                             "connection_errors": consecutive_connection_errors
                         }))
                         
@@ -1088,12 +1109,7 @@ def main():
                 except (ServiceBusConnectionError, ServiceBusError) as sbe:
                     error_count += 1
                     consecutive_connection_errors += 1
-                    logger.error_with_context(
-                        "Service Bus connection error",
-                        exc_info=True,
-                        error=str(sbe),
-                        consecutive_errors=consecutive_connection_errors
-                    )
+                    logger.error(f"Service Bus connection error: {str(sbe)}")
                     
                     # Log to Cosmos DB
                     log_container_health_issue("servicebus_error", str(sbe))
@@ -1108,11 +1124,7 @@ def main():
                     
                 except Exception as batch_error:
                     error_count += 1
-                    logger.error_with_context(
-                        "Error receiving messages batch",
-                        exc_info=True,
-                        error=str(batch_error)
-                    )
+                    logger.error(f"Error receiving messages batch: {str(batch_error)}")
                     
                     # Log to Cosmos DB
                     log_container_health_issue("batch_error", str(batch_error))
@@ -1126,13 +1138,9 @@ def main():
                     time.sleep(5)
                 
         except KeyboardInterrupt:
-            logger.log_with_context("Stopping message processing due to keyboard interrupt")
+            logger.info("Stopping message processing due to keyboard interrupt")
         except Exception as e:
-            logger.error_with_context(
-                "Error in message processing loop",
-                exc_info=True,
-                error=str(e)
-            )
+            logger.error(f"Error in message processing loop: {str(e)}", exc_info=True)
             # Log to Cosmos DB and attempt to restart
             log_container_health_issue("fatal_error", str(e))
             restart_processing()
@@ -1141,11 +1149,11 @@ def main():
             if len(pending_conversations) > 0:
                 maybe_flush_conversation_batch(force=True)
                 
-            logger.log_with_context("Closing connections")
+            logger.info("Closing connections")
             
             # Log shutdown event to Cosmos DB
             log_container_health_issue("container_shutdown", "Container shutting down")
 
 if __name__ == "__main__":
-    logger.log_with_context("NL2SQL Queue Processor starting up")
+    logger.info("NL2SQL Queue Processor starting up")
     main()
