@@ -102,7 +102,7 @@ consecutive_connection_errors = 0
 # Constants
 ASSISTANT_INACTIVITY_TIMEOUT = 60 * 60  # 60 minutes in seconds
 BULK_INSERT_THRESHOLD = 10  # Number of conversations to batch before inserting
-HEALTH_CHECK_INTERVAL = 300  # 5 minutes
+HEALTH_CHECK_INTERVAL = 2700  # 45 minutes
 NO_MESSAGES_TIMEOUT = 1800  # 30 minutes (no messages received)
 MAX_CONNECTION_ERRORS = 10  # Max consecutive connection errors before restart
 CONNECTION_ERROR_SLEEP = 10  # Seconds to sleep after a connection error
