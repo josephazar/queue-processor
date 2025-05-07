@@ -58,6 +58,7 @@ class CosmosDBManager:
             self._collection = self._db[MONGODB_COLLECTION_NAME]
             self._conversation_collection = self._db["conversations"]
             self._health_collection = self._db["container_health"]
+            self._assistant_pool_collection = self._db["assistant_pool"]
             
             # Create indexes if needed for requests collection
             self._collection.create_index("request_id", unique=True)
@@ -89,7 +90,9 @@ class CosmosDBManager:
             self._health_collection.create_index("timestamp")
             self._health_collection.create_index("error_type")
             self._health_collection.create_index("container_id")
-            
+
+            self._assistant_pool_collection.create_index("assistant_id", unique=True)
+
             logger.info(f"MongoDB connection initialized successfully to database: {MONGODB_DATABASE_NAME}")
             
         except ConnectionFailure as e:
@@ -116,6 +119,10 @@ class CosmosDBManager:
         if self._client:
             self._client.close()
             logger.info("MongoDB connection closed")
+            
+    def get_assistant_pool_collection(self):
+        """Get the MongoDB collection for assistant pool"""
+        return self._assistant_pool_collection
 
 # Retry decorator for database operations with exponential backoff
 @backoff.on_exception(
@@ -490,48 +497,31 @@ def get_container_health_history(container_id=None, error_type=None, limit=50):
         
     return documents
 
-
-# Add these functions to database.py
 @db_operation_with_retry
 def get_pool_assistants():
-    """
-    Get assistants from the pool stored in Cosmos DB
-    
-    Returns:
-        list: List of assistant IDs in the pool
-    """
+    """Get assistants from the pool stored in Cosmos DB"""
     try:
-        collection = CosmosDBManager.get_instance().get_collection()
-        
-        # Find documents with type "assistant_pool"
-        cursor = collection.find({"type": "assistant_pool"})
+        collection = CosmosDBManager.get_instance().get_assistant_pool_collection()
+        cursor = collection.find({})
         
         assistants = []
         for doc in cursor:
             assistants.append(doc["assistant_id"])
             
         return assistants
-        
     except Exception as e:
-        # Log to console/file if we can't access DB
         logger.error(f"Failed to get pool assistants from Cosmos DB: {str(e)}")
         return []
 
 @db_operation_with_retry
 def store_pool_assistant(assistant_id):
-    """
-    Store an assistant ID in the pool in Cosmos DB
-    
-    Args:
-        assistant_id (str): The assistant ID to store
-    """
+    """Store an assistant ID in the pool in Cosmos DB"""
     try:
-        collection = CosmosDBManager.get_instance().get_collection()
+        collection = CosmosDBManager.get_instance().get_assistant_pool_collection()
         
         # Format the document
         now = int(time.time())
         document = {
-            "type": "assistant_pool",
             "assistant_id": assistant_id,
             "created_at": now,
             "updated_at": now
@@ -539,37 +529,26 @@ def store_pool_assistant(assistant_id):
         
         # Insert the document
         collection.update_one(
-            {"type": "assistant_pool", "assistant_id": assistant_id},
+            {"assistant_id": assistant_id},
             {"$set": document},
             upsert=True
         )
         
         logger.debug(f"Stored assistant {assistant_id} in pool")
         return True
-        
     except Exception as e:
-        # Log to console/file if we can't log to DB
         logger.error(f"Failed to store pool assistant in Cosmos DB: {str(e)}")
         return False
 
 @db_operation_with_retry
 def remove_pool_assistant(assistant_id):
-    """
-    Remove an assistant ID from the pool in Cosmos DB
-    
-    Args:
-        assistant_id (str): The assistant ID to remove
-    """
+    """Remove an assistant ID from the pool in Cosmos DB"""
     try:
-        collection = CosmosDBManager.get_instance().get_collection()
-        
-        # Delete the document
-        collection.delete_one({"type": "assistant_pool", "assistant_id": assistant_id})
+        collection = CosmosDBManager.get_instance().get_assistant_pool_collection()
+        collection.delete_one({"assistant_id": assistant_id})
         
         logger.debug(f"Removed assistant {assistant_id} from pool")
         return True
-        
     except Exception as e:
-        # Log to console/file if we can't log to DB
         logger.error(f"Failed to remove pool assistant from Cosmos DB: {str(e)}")
         return False

@@ -12,6 +12,7 @@ import importlib.util
 from pathlib import Path
 from openai import AzureOpenAI
 import openai
+import pymongo
 
 # Import configuration
 from config import (
@@ -566,61 +567,99 @@ def maybe_flush_conversation_batch(force=False):
                 except Exception as inner_e:
                     logger.error(f"Failed to store individual conversation: {str(inner_e)}")
 
+def get_conversation_context(user_email, request_type="nl2sql_chat"):
+    """
+    Retrieve recent conversation history from Cosmos DB and format it
+    
+    Args:
+        user_email: The user's email to look up conversation history
+        request_type: The type of request to filter by
+        
+    Returns:
+        str: A formatted history of previous conversations, or empty string if none
+    """
+    if not user_email:
+        return ""
+    
+    cursor = None
+    try:
+        # Use existing database function to get conversation history
+        from database import CosmosDBManager
+        collection = CosmosDBManager.get_instance().get_conversation_collection()
+        
+        # Query for recent conversations
+        cursor = collection.find(
+            {"user_email": user_email, "request_type": request_type}
+        ).sort("created_at", pymongo.DESCENDING).limit(2)
+        
+        # Convert to list (this exhausts the cursor)
+        recent_conversations = list(cursor)
+        
+        # Process conversations to remove ObjectId and convert to dict
+        processed_conversations = []
+        for doc in recent_conversations:
+            doc_dict = dict(doc)
+            if "_id" in doc_dict:
+                doc_dict["_id"] = str(doc_dict["_id"])
+            processed_conversations.append(doc_dict)
+        
+        # If no history, return empty context
+        if not processed_conversations or len(processed_conversations) == 0:
+            return ""
+        
+        # Format conversations - show in reverse chronological order (oldest first)
+        # This makes the conversation flow naturally
+        convo_text = "Previous conversation:\n"
+        for convo in reversed(processed_conversations):
+            convo_text += f"User: {convo.get('question', '')}\n"
+            convo_text += f"Assistant: {convo.get('answer', '')}\n"
+        
+        return convo_text
+            
+    except Exception as e:
+        logger.error(f"Error retrieving conversation history: {str(e)}", exc_info=True)
+        return ""  # Return empty context if retrieval fails
+    
+    finally:
+        # Ensure cursor is closed even if an exception occurs
+        if cursor:
+            cursor.close()
+
+
 async def process_question(request_id, question, assistant_id=None, thread_id=None, user_email=None, request_type=None, report_name=None):
     """
     Process a user question using the NL2SQL assistant.
-    This is the core function that communicates with the AI model.
+    Creates a new thread for each request, adding context from previous conversations if available.
     """
     start_time = time.time()
-    new_thread_created = False  # Track if we created a new thread
     
     try:
         logger.info(f"Processing question for request_id={request_id}, user_email={user_email}")
         
-        # Check if this is a termination request
-        if any(word in question.lower().split() for word in ["bye", "exit", "end"]):
-            logger.info(f"Received termination request from user_email={user_email}")
-            
-            # Don't delete assistants in pool, just release the assignment
-            if assistant_id:
-                with assistant_pool_lock:
-                    if assistant_id in assistant_pool:
-                        release_assistant(assistant_id)
-                        
-                        # Also clear thread cache for this user
-                        with thread_cache_lock:
-                            if user_email in thread_cache:
-                                del thread_cache[user_email]
-                        
-                        return {
-                            "status": "success", 
-                            "message": "Goodbye! Your conversation has ended.", 
-                            "assistant_id": None, 
-                            "thread_id": None
-                        }
-                    else:
-                        # Not in our pool, safe to delete
-                        return await delete_assistant(assistant_id)
-            else:
-                return {
-                    "status": "success", 
-                    "message": "Goodbye!", 
-                    "assistant_id": None, 
-                    "thread_id": None
-                }
+        # Get conversation context from Cosmos DB if user_email is provided
+        context = ""
+        if user_email:
+            context = get_conversation_context(user_email)
         
-        # Get an assistant from the pool or reuse existing assignment
-        if not assistant_id and not thread_id and user_email:
-            assistant_id, thread_id, is_new_thread = get_available_assistant(user_email)
-            new_thread_created = is_new_thread
+        # Add context to question if available
+        # print original question
+        logger.info(f"Original question: {question}")
+        enhanced_question = question
+        if context:
+            enhanced_question = f"{context}\nCurrent question: {question}"
+
+        logger.info(f"Enhanced question: {enhanced_question}")
         
-        # Initialize assistant - will be from pool
+        
+        # Get an available assistant from the pool
+        assistant_id, _, _ = get_available_assistant(user_email)
+        
+        # Initialize assistant
         try:
             logger.info(f"Using assistant_id={assistant_id}")
             sql_assistant = initialize_assistant(DATABASE_TYPE, assistant_id=assistant_id)
         except openai.NotFoundError:
-            # The assistant ID doesn't exist anymore (shouldn't happen with pool)
-            logger.error(f"Assistant not found: {assistant_id}. This shouldn't happen with the pool approach.")
+            logger.error(f"Assistant not found: {assistant_id}")
             
             # Remove from pool and DB since it no longer exists
             with assistant_pool_lock:
@@ -632,23 +671,16 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             remove_pool_assistant(assistant_id)
             
             # Try to get a different assistant from the pool
-            assistant_id, thread_id, is_new_thread = get_available_assistant(user_email)
-            new_thread_created = is_new_thread
+            assistant_id, _, _ = get_available_assistant(user_email)
             
             # Initialize with the new assistant
             sql_assistant = initialize_assistant(DATABASE_TYPE, assistant_id=assistant_id)
             logger.info(f"Created replacement assistant: {assistant_id}")
 
-        # Create a thread if needed
-        if not thread_id:
-            thread = sql_assistant.assistant.create_thread()
-            thread_id = thread.id
-            new_thread_created = True
-            logger.info(f"Created new thread: {thread_id} for assistant: {assistant_id}")
-            
-            # Update assignments
-            if user_email:
-                update_thread_assignment(assistant_id, thread_id, user_email)
+        # Always create a new thread
+        thread = sql_assistant.assistant.create_thread()
+        thread_id = thread.id
+        logger.info(f"Created new thread: {thread_id} for assistant: {assistant_id}")
         
         # Process the question
         try:
@@ -656,9 +688,9 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             start_processing_time = time.time()
             timeout = 120  # 2 minute timeout
             
-            # Call create_response directly - it's not awaitable
+            # Call create_response with the enhanced question
             response_dict = sql_assistant.assistant.create_response(
-                question=question,
+                question=enhanced_question,
                 thread_id=thread_id
             )
             
@@ -670,77 +702,83 @@ async def process_question(request_id, question, assistant_id=None, thread_id=No
             # Extract answer
             answer = response_dict.get("answer", "No answer was generated")
             
-            # Prepare conversation document
-            conversation_doc = {
-                "request_id": request_id,
-                "question": question,
-                "answer": answer,
-                "user_email": user_email,
-                "assistant_id": assistant_id,
-                "thread_id": thread_id,
-                "report_name": report_name,
-                "request_type": request_type,
-                "conversation_id": None,  # We don't have conversation_id yet
-                "created_at": int(time.time()),
-                "updated_at": int(time.time())
-            }
+            # Store in Cosmos DB
+            store_conversation(
+                request_id=request_id,
+                question=question,  # Store original question, not enhanced
+                answer=answer,
+                user_email=user_email,
+                assistant_id=assistant_id,
+                thread_id=thread_id,
+                report_name=report_name,
+                request_type=request_type
+            )
             
-            # Add to batch for bulk insertion
-            with pending_conversations_lock:
-                pending_conversations.append(conversation_doc)
+            # Delete the thread to clean up
+            try:
+                client = AzureOpenAI(
+                    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+                    azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"),
+                )
+                client.beta.threads.delete(thread_id=thread_id)
+                logger.info(f"Deleted thread: {thread_id}")
+            except Exception as thread_error:
+                logger.warning(f"Could not delete thread {thread_id}: {str(thread_error)}")
             
-            # Check if we should do a bulk insert
-            maybe_flush_conversation_batch()
-            
-            # Update the last_used time for this assistant
+            # Release the assistant back to the pool
             with assistant_pool_lock:
-                if assistant_id in assistant_assignments:
-                    assistant_assignments[assistant_id]["last_used"] = time.time()
+                if assistant_id in assistant_pool:
+                    release_assistant(assistant_id)
+                    logger.info(f"Released assistant {assistant_id} back to pool")
             
             # Calculate total processing time
             total_duration = time.time() - start_time
             logger.info(f"Completed processing question in {total_duration:.2f}s")
             
-            # Return the response with assistant and thread IDs
+            # Return the response (no thread_id or assistant_id needed anymore)
             return {
                 "status": "success", 
-                "response": answer,
-                "assistant_id": assistant_id,
-                "thread_id": thread_id
+                "response": answer
             }
+            
         except Exception as e:
             logger.error(f"Error calling create_response: {str(e)}", exc_info=True)
             
-            # If we created a new thread but there was an error, we should clean up
-            if new_thread_created:
-                # Don't clean up the assistant (it's in the pool) but make it available again
-                with assistant_pool_lock:
-                    if assistant_id in assistant_assignments:
-                        assistant_assignments[assistant_id]["in_use"] = False
-                        assistant_assignments[assistant_id]["thread_id"] = None
-                
-                # Remove from thread cache if present
-                with thread_cache_lock:
-                    if user_email in thread_cache and thread_cache[user_email]["thread_id"] == thread_id:
-                        del thread_cache[user_email]
+            # Clean up assistant and thread
+            with assistant_pool_lock:
+                if assistant_id in assistant_pool:
+                    release_assistant(assistant_id)
+            
+            try:
+                client = AzureOpenAI(
+                    api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                    api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+                    azure_endpoint=os.getenv("AZURE_OPENAI_API_ENDPOINT"),
+                )
+                client.beta.threads.delete(thread_id=thread_id)
+            except:
+                pass  # Ignore errors when cleaning up
             
             return {
                 "status": "error",
-                "message": f"Error processing question: {str(e)}",
-                "assistant_id": assistant_id,  # Keep the assistant_id since it's from the pool
-                "thread_id": None  # Clear the thread_id since there was an error
+                "message": f"Error processing question: {str(e)}"
             }
     
     except Exception as e:
         logger.error(f"Error processing question: {str(e)}", exc_info=True)
         
+        # Make sure to release the assistant in case of any error
+        if assistant_id:
+            with assistant_pool_lock:
+                if assistant_id in assistant_pool:
+                    release_assistant(assistant_id)
+        
         return {
             "status": "error",
-            "message": f"Error processing question: {str(e)}",
-            "assistant_id": assistant_id,  # Keep the assistant_id if it exists
-            "thread_id": None
+            "message": f"Error processing question: {str(e)}"
         }
-
+      
 def process_message(message, action_queue):
     """
     Process a single message from the queue with improved thread safety

@@ -42,7 +42,7 @@ def verifyQuery(query, schema):
     
     
     response = client.chat.completions.create(
-        model=os.getenv("AZURE_OPENAI_MODEL_NAME"),
+        model=os.getenv("AZURE_OPENAI_MODEL_GPTMINI"),
         response_model=VerifiedQuery,
         messages=[system_message,{"role": "user", "content": prompt}],
         max_tokens=200,
@@ -220,7 +220,7 @@ class FetchDistinctValues(Function):
                 FROM [dbo].[{view_name}]
                 GROUP BY [{column_name}]
                 ORDER BY qty DESC
-                OFFSET 0 ROWS FETCH NEXT 50 ROWS ONLY;
+                OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;
             """
             # Alternatively, you could just do "SELECT TOP 10 ..." in T-SQL:
             #   SELECT TOP 10 [column_name], COUNT(*) AS qty
